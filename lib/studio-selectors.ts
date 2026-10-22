@@ -52,25 +52,33 @@ export const STUDIO_SELECTORS = {
 
   /** Right-side Run Settings panel toggle (if collapsed) */
   runSettingsToggle: [
-    'button[aria-label*="Run settings" i]',
+    'button[aria-label="Toggle run settings panel" i]',
     'button[aria-label*="Toggle run settings" i]',
+    'button[aria-label*="Run settings" i]',
     'button[mattooltip*="Run settings" i]',
+    'button:has(span.material-symbols-outlined:has-text("tune"))',
+    'button:has(mat-icon:has-text("tune"))',
   ],
 
-  /** Model selector dropdown trigger */
+  /** Model selector card / dropdown trigger at top of Run Settings panel */
   modelSelectorTrigger: [
     'ms-model-selector button',
+    'ms-model-selector .model-selector-card',
     'ms-model-selector mat-select',
+    'ms-model-selector',
     '[data-test-id="model-selector"]',
+    '[data-test-id*="model-selector" i]',
     'button[aria-label*="Model" i]',
     'mat-select[aria-label*="Model" i]',
     '.model-selector-trigger',
+    '.model-selector-card',
   ],
 
   /** Model search input or option list inside model picker */
   modelSearchInput: [
     'input[placeholder*="Search models" i]',
     'input[aria-label*="Search models" i]',
+    'input[placeholder*="Search" i]',
     '.mat-mdc-select-panel input',
   ],
 
@@ -87,16 +95,21 @@ export const STUDIO_SELECTORS = {
   thinkingToggle: [
     'mat-slide-toggle[aria-label*="Thinking" i] button[role="switch"]',
     '[data-test-id*="thinking-toggle" i] button[role="switch"]',
-    'div:has-text("Thinking mode") button[role="switch"]',
   ],
 
   /** Thinking level / budget dropdown trigger */
   thinkingLevelSelect: [
+    'mat-select[aria-label*="Thinking level" i]',
     'mat-select[aria-label*="Thinking" i]',
-    '[data-test-id*="thinking-level" i]',
-    'div:has-text("Thinking level") mat-select',
-    'div:has-text("Thinking budget") mat-select',
+    '[role="combobox"][aria-label*="Thinking level" i]',
+    '[role="combobox"][aria-label*="Thinking" i]',
     'button[aria-label*="Thinking level" i]',
+    '[data-test-id*="thinking-level" i] mat-select',
+    '[data-test-id*="thinking-level" i] [role="combobox"]',
+    '[data-test-id*="thinking-level" i] button',
+    '[data-test-id*="thinking-level" i]',
+    'mat-form-field:has-text("Thinking level") mat-select',
+    'mat-form-field:has-text("Thinking") mat-select',
   ],
 
   /** Advanced settings accordion inside Run Settings */
@@ -111,7 +124,6 @@ export const STUDIO_SELECTORS = {
     'button:has-text("Edit safety settings")',
     'button[aria-label*="Safety settings" i]',
     '[data-test-id*="safety-settings" i] button',
-    'div:has-text("Safety settings") button',
   ],
 
   /** Inside Safety settings modal: sliders or Off buttons */
@@ -145,8 +157,10 @@ export const STUDIO_SELECTORS = {
   /** Media resolution dropdown in Run Settings (Low = ~65 tokens/frame) */
   mediaResolutionSelect: [
     'mat-select[aria-label*="Media resolution" i]',
+    '[role="combobox"][aria-label*="Media resolution" i]',
     '[data-test-id*="media-resolution" i] mat-select',
-    'div:has-text("Media resolution") mat-select',
+    '[data-test-id*="media-resolution" i] [role="combobox"]',
+    'mat-form-field:has-text("Media resolution") mat-select',
     'button[aria-label*="Media resolution" i]',
   ],
 
@@ -241,6 +255,9 @@ export const STUDIO_SELECTORS = {
 
   /** Video settings / clip range / FPS (gear) button on a video chip */
   videoChipSettingsButton: [
+    'button[aria-label="Edit video options" i]',
+    'button[aria-label*="Edit video options" i]',
+    'button[aria-label*="Video options" i]',
     'button[aria-label*="Video settings" i]',
     'button[aria-label*="Media settings" i]',
     'button[aria-label*="Edit video" i]',
@@ -261,12 +278,8 @@ export const STUDIO_SELECTORS = {
     'button:has(span.google-symbols:has-text("tune"))',
     'button:has(span:has-text("settings"))',
     'button:has(span:has-text("tune"))',
+    '[role="button"][aria-label*="Edit video options" i]',
     '[role="button"][aria-label*="settings" i]',
-    '[role="button"]:has(span:has-text("settings"))',
-    '[role="button"]:has(mat-icon:has-text("settings"))',
-    'mat-icon:has-text("settings")',
-    'span.material-symbols-outlined:has-text("settings")',
-    'span.google-symbols:has-text("settings")',
   ],
 
   /** Inside Video Settings popover/dialog: Start time, End time, FPS inputs */

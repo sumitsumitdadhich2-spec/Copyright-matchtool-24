@@ -577,8 +577,232 @@ class StudioBrowserController {
   }
 
   /**
-   * Step (b): Configure model name, temperature = 0, thinking level = High,
-   * max output tokens, media resolution (~65 tokens/frame = Low), and safety settings all OFF.
+  /**
+   * Problem 2(d): Dump the Run Settings panel HTML + controls to the step log when
+   * model list / thinking level dropdown selectors are not found or verification fails.
+   */
+  private async dumpRunSettingsPanelDiagnostics(page: Page, reason: string): Promise<void> {
+    try {
+      const dump = await page.evaluate(() => {
+        const panelCandidates = Array.from(
+          document.querySelectorAll(
+            'ms-run-settings, [class*="run-settings" i], aside, .right-side-panel, [data-test-id*="run-settings" i]',
+          ),
+        )
+        const panelEl =
+          panelCandidates.find((el) => (el as HTMLElement).offsetParent !== null) ||
+          panelCandidates[0] ||
+          null
+
+        const overlayPanes = Array.from(document.querySelectorAll('.cdk-overlay-pane, [role="listbox"], [role="menu"], [role="dialog"]'))
+          .filter((el) => (el.textContent || '').trim().length > 0)
+          .map((el) => el.outerHTML.slice(0, 1500))
+          .join(' || ')
+
+        const panelHtml = panelEl
+          ? panelEl.outerHTML.slice(0, 3000)
+          : `No ms-run-settings panel found. Body snippet: ${(document.body.innerText || '').slice(0, 800)}`
+
+        const controls = Array.from(
+          (panelEl || document.body).querySelectorAll(
+            'button, mat-select, [role="combobox"], [role="listbox"], [role="option"], mat-option, input',
+          ),
+        )
+          .slice(0, 40)
+          .map((c) => {
+            const tag = c.tagName.toLowerCase()
+            const aria = c.getAttribute('aria-label') || ''
+            const role = c.getAttribute('role') || ''
+            const cls = (c.getAttribute('class') || '').slice(0, 60)
+            const txt = ((c as HTMLElement).innerText || c.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80)
+            return `<${tag}${role ? ` role="${role}"` : ''}${aria ? ` aria="${aria}"` : ''}${cls ? ` class="${cls}"` : ''}>"${txt}"`
+          })
+          .join(' ; ')
+
+        return {
+          panelHtml,
+          overlayHtml: overlayPanes.slice(0, 2000),
+          controls: controls.slice(0, 3000),
+        }
+      })
+
+      this.logStep(`diag panel HTML`, `${reason} :: ${dump.panelHtml}`, 'warn')
+      if (dump.overlayHtml) {
+        this.logStep(`diag overlay HTML`, dump.overlayHtml, 'warn')
+      }
+      this.logStep(`diag panel controls`, dump.controls || 'none', 'warn')
+      console.warn(`[Studio RunSettings Diag] ${reason} :: panelHtml:`, dump.panelHtml)
+      if (dump.overlayHtml) {
+        console.warn(`[Studio RunSettings Diag] overlayHtml:`, dump.overlayHtml)
+      }
+      console.warn(`[Studio RunSettings Diag] controls:`, dump.controls)
+    } catch (err) {
+      this.logStep('diag panel err', (err as Error).message, 'warn')
+    }
+  }
+
+  /**
+   * Read the currently visible model card text at the top of the Run Settings panel.
+   */
+  private async readVisibleModelCardText(page: Page): Promise<string> {
+    try {
+      return await page.evaluate((triggerSels) => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        for (const sel of triggerSels) {
+          const nodes = Array.from(document.querySelectorAll(sel))
+          for (const node of nodes) {
+            if (!isVisible(node)) continue
+            const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
+            if (t && /gemini/i.test(t)) return t
+          }
+        }
+
+        // Fallback: search inside the Run Settings panel for the top card/button showing "Gemini ..."
+        const panelRoot =
+          document.querySelector('ms-run-settings, [class*="run-settings" i], aside') || document.body
+        const all = Array.from(panelRoot.querySelectorAll('ms-model-selector, button, a, [role="button"], div, span'))
+        for (const node of all) {
+          if (!isVisible(node)) continue
+          const r = node.getBoundingClientRect()
+          if (r.height > 140 || r.width > 550) continue
+          const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
+          if (/^gemini\s+\d+(\.\d+)?/i.test(t) || /\bgemini\s+3\.8\b/i.test(t) || /\bgemini\s+2\.5\b/i.test(t)) {
+            return t
+          }
+        }
+        return ''
+      }, [...STUDIO_SELECTORS.modelSelectorTrigger])
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * Read the currently visible text of the "Thinking level" dropdown in the Run Settings panel.
+   */
+  private async readVisibleThinkingLevelText(page: Page): Promise<string> {
+    try {
+      return await page.evaluate((thinkSels) => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        for (const sel of thinkSels) {
+          const nodes = Array.from(document.querySelectorAll(sel))
+          for (const node of nodes) {
+            if (!isVisible(node)) continue
+            const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
+            if (t) return t
+          }
+        }
+
+        // Row-scoped lookup: find the compact row containing "Thinking level" and read its dropdown/button value
+        const all = Array.from(document.body.querySelectorAll('*'))
+        const labelNodes = all.filter((el) => {
+          if (!isVisible(el)) return false
+          const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
+          return /^thinking\s+level$/i.test(t)
+        })
+
+        for (const lbl of labelNodes) {
+          let row: Element | null = lbl.parentElement
+          for (let depth = 0; depth < 5 && row; depth++) {
+            const r = row.getBoundingClientRect()
+            if (r.height <= 140 && r.width <= 600) {
+              const ctrl = row.querySelector(
+                'mat-select, [role="combobox"], button[aria-haspopup], select, .mat-mdc-select-value, button',
+              ) as HTMLElement | null
+              if (ctrl && isVisible(ctrl)) {
+                const val = (ctrl.innerText || ctrl.textContent || (ctrl as HTMLInputElement).value || '')
+                  .trim()
+                  .replace(/\s+/g, ' ')
+                if (val && !/^thinking\s+level$/i.test(val)) {
+                  return val
+                }
+              }
+            }
+            row = row.parentElement
+          }
+        }
+        return ''
+      }, [...STUDIO_SELECTORS.thinkingLevelSelect])
+    } catch {
+      return ''
+    }
+  }
+
+  /**
+   * Tag the dropdown control (mat-select / [role="combobox"] / button) inside a compact
+   * Run Settings row identified by its label text (e.g. "Thinking level" or "Media resolution")
+   * with `data-cmt-row-select="<attrVal>"` so Playwright can click it without matching unrelated dropdowns.
+   */
+  private async markRowDropdownByLabel(
+    page: Page,
+    rowLabelRegexSource: string,
+    attrVal: string,
+  ): Promise<boolean> {
+    try {
+      return await page.evaluate(
+        ({ regexSrc, marker }) => {
+          document
+            .querySelectorAll(`[data-cmt-row-select="${marker}"]`)
+            .forEach((el) => el.removeAttribute('data-cmt-row-select'))
+
+          const re = new RegExp(regexSrc, 'i')
+          const isVisible = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          const all = Array.from(document.body.querySelectorAll('*'))
+          const labelLeaves = all.filter((el) => {
+            if (!isVisible(el)) return false
+            const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
+            return re.test(t) && t.length <= 40
+          })
+
+          for (const leaf of labelLeaves) {
+            let row: Element | null = leaf.parentElement
+            for (let depth = 0; depth < 5 && row; depth++) {
+              const r = row.getBoundingClientRect()
+              if (r.height >= 18 && r.height <= 150 && r.width <= 600) {
+                const ctrl = row.querySelector(
+                  'mat-select, [role="combobox"], button[aria-haspopup], select, button:not([aria-label*="info" i]):not([aria-label*="help" i])',
+                ) as HTMLElement | null
+                if (ctrl && isVisible(ctrl) && ctrl !== leaf && !ctrl.contains(leaf)) {
+                  ctrl.setAttribute('data-cmt-row-select', marker)
+                  return true
+                }
+              }
+              row = row.parentElement
+            }
+          }
+          return false
+        },
+        { regexSrc: rowLabelRegexSource, marker: attrVal },
+      )
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Step (b): Configure model name (default 'Gemini 3.8 Pro', fallback to first '3.8' entry),
+   * Thinking level = High, temperature = 0, max output tokens, media resolution = Low,
+   * and safety settings all OFF.
+   * Reads back visible model card text and thinking level dropdown text to verify, retries once,
+   * dumps panel HTML if selectors are missing, and THROWS if either fails verification.
    */
   private async configureRunSettings(
     page: Page,
@@ -587,44 +811,268 @@ class StudioBrowserController {
   ) {
     await this.waitIfPausedOrThrowIfStopped(scope)
 
-    // Ensure Run Settings panel is open
-    const tempLocCheck = await findFirstVisibleLocator(page, STUDIO_SELECTORS.temperatureInput, 1500)
-    if (!tempLocCheck) {
-      const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 1500)
+    // 0. Ensure Run Settings panel is open (button[aria-label="Toggle run settings panel"], icon "tune")
+    const isPanelAlreadyOpen = await page
+      .evaluate(() => {
+        const panel = document.querySelector('ms-run-settings, [class*="run-settings" i]') as HTMLElement | null
+        if (panel && panel.getBoundingClientRect().width > 40) return true
+        const bodyText = document.body.innerText || ''
+        return /thinking\s+level/i.test(bodyText) && /temperature/i.test(bodyText)
+      })
+      .catch(() => false)
+
+    if (!isPanelAlreadyOpen) {
+      const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2500)
       if (toggle) {
         await toggle.click().catch(() => {})
-        await new Promise((r) => setTimeout(r, 400))
+        await new Promise((r) => setTimeout(r, 500))
+      } else {
+        await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings toggle button not found')
       }
     }
 
-    // 1. Select Model by name
-    const targetModel = config.modelName.trim()
-    if (targetModel) {
-      try {
-        const trigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2500)
-        if (trigger) {
-          const currentText = (await trigger.innerText().catch(() => '')).trim()
-          if (!currentText.toLowerCase().includes(targetModel.toLowerCase())) {
-            await trigger.click()
-            await new Promise((r) => setTimeout(r, 400))
-            const searchInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSearchInput, 1200)
-            if (searchInput) {
-              await searchInput.fill(targetModel)
-              await new Promise((r) => setTimeout(r, 300))
+    // 1. Select Model (prefer configured studioModelName, default 'Gemini 3.8 Pro'; fallback to 'Gemini 3.8 Pro' -> 'Gemini 3.8 Flash' -> first '3.8' entry)
+    const targetModel = (config.modelName || 'Gemini 3.8 Pro').trim()
+    let verifiedModelText = ''
+    let modelConfigError = ''
+
+    for (let modelAttempt = 1; modelAttempt <= 2; modelAttempt++) {
+      await this.waitIfPausedOrThrowIfStopped(scope)
+      modelConfigError = ''
+
+      const currentCardText = await this.readVisibleModelCardText(page)
+      const targetLower = targetModel.toLowerCase()
+
+      // Check if current model card already matches the exact requested model (e.g. "Gemini 3.8 Pro")
+      if (currentCardText && currentCardText.toLowerCase().includes(targetLower)) {
+        verifiedModelText = currentCardText
+        break
+      }
+
+      // Click the model card at the top of the Run Settings panel (or its 3-dot / trigger button) to open the model list
+      let clickedTrigger = false
+      const triggerLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2000)
+      if (triggerLoc) {
+        await triggerLoc.click().catch(() => {})
+        clickedTrigger = true
+      } else {
+        // Fallback: find the visible model card / button at top of Run Settings panel showing "Gemini ..."
+        const markedCard = await page
+          .evaluate(() => {
+            document
+              .querySelectorAll('[data-cmt-model-card]')
+              .forEach((el) => el.removeAttribute('data-cmt-model-card'))
+            const root =
+              document.querySelector('ms-run-settings, [class*="run-settings" i], aside') || document.body
+            const candidates = Array.from(
+              root.querySelectorAll('ms-model-selector, button, [role="button"], [role="combobox"], div'),
+            )
+            for (const c of candidates) {
+              const el = c as HTMLElement
+              const r = el.getBoundingClientRect()
+              if (r.width < 40 || r.width > 550 || r.height < 20 || r.height > 130) continue
+              const t = (el.innerText || el.textContent || '').trim()
+              if (/gemini\s+\d+(\.\d+)?/i.test(t)) {
+                // Prefer a button inside or the card itself
+                const btn = el.querySelector('button, [role="button"]') as HTMLElement | null
+                ;(btn || el).setAttribute('data-cmt-model-card', 'true')
+                return true
+              }
             }
-            const opt = page
-              .locator(`mat-option:has-text("${targetModel}"), [role="option"]:has-text("${targetModel}"), .model-option:has-text("${targetModel}")`)
-              .first()
-            if ((await opt.count()) > 0) {
-              await opt.click()
-              await new Promise((r) => setTimeout(r, 350))
-            } else {
-              await page.keyboard.press('Escape')
-            }
+            return false
+          })
+          .catch(() => false)
+
+        if (markedCard) {
+          const fallbackCard = page.locator('[data-cmt-model-card="true"]').first()
+          if ((await fallbackCard.count()) > 0) {
+            await fallbackCard.click().catch(() => {})
+            clickedTrigger = true
           }
         }
-      } catch {
-        /* continue with default selected model */
+      }
+
+      await new Promise((r) => setTimeout(r, 500))
+
+      // Check if model list options are visible; if not, try clicking any 3-dot / more / chevron button on the model card
+      const countVisibleOptions = async () =>
+        page
+          .locator(
+            'mat-option, [role="option"], [role="menuitem"], ms-model-option, .model-option, .cdk-overlay-pane [class*="model" i]',
+          )
+          .count()
+          .catch(() => 0)
+
+      if ((await countVisibleOptions()) === 0) {
+        const moreClicked = await page
+          .evaluate(() => {
+            const root =
+              document.querySelector('ms-model-selector, [data-cmt-model-card="true"], ms-run-settings') ||
+              document.body
+            const btns = Array.from(root.querySelectorAll('button, [role="button"]'))
+            for (const b of btns) {
+              const el = b as HTMLElement
+              const r = el.getBoundingClientRect()
+              if (r.width <= 0 || r.height <= 0 || r.top > 300) continue
+              const meta = (
+                (el.getAttribute('aria-label') || '') +
+                ' ' +
+                (el.getAttribute('mattooltip') || '') +
+                ' ' +
+                (el.textContent || '')
+              ).toLowerCase()
+              if (/model|more_vert|more_horiz|expand_more|arrow_drop_down|chevron|switch|change/i.test(meta)) {
+                el.click()
+                return true
+              }
+            }
+            return false
+          })
+          .catch(() => false)
+        if (moreClicked) {
+          clickedTrigger = true
+          await new Promise((r) => setTimeout(r, 500))
+        }
+      }
+
+      if (!clickedTrigger) {
+        await this.dumpRunSettingsPanelDiagnostics(page, `model selector trigger not found (attempt ${modelAttempt}/2)`)
+      }
+
+      // Inspect options in the opened model list and click the best match:
+      // 1) exact/substring match for targetModel (e.g. "Gemini 3.8 Pro")
+      // 2) "Gemini 3.8 Pro"
+      // 3) "Gemini 3.8 Flash"
+      // 4) first entry containing "3.8"
+      const pickResult = await page
+        .evaluate((desiredModel) => {
+          const isVisible = (el: Element): el is HTMLElement => {
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          document
+            .querySelectorAll('[data-cmt-picked-model]')
+            .forEach((el) => el.removeAttribute('data-cmt-picked-model'))
+
+          const rawOptions = Array.from(
+            document.querySelectorAll(
+              'mat-option, [role="option"], [role="menuitem"], ms-model-option, .model-option, .cdk-overlay-pane button, .cdk-overlay-pane [role="button"], .cdk-overlay-pane div[class*="option" i], .cdk-overlay-pane div[class*="item" i], .cdk-overlay-pane div[class*="card" i]',
+            ),
+          ).filter((el) => {
+            if (!isVisible(el)) return false
+            const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
+            return t.length > 0 && t.length < 300 && (/gemini/i.test(t) || /3\.8/i.test(t) || /2\.5/i.test(t))
+          })
+
+          // Keep minimal option rows so we don't pick a wrapper div containing all options
+          const options = rawOptions.filter(
+            (el) => !rawOptions.some((child) => child !== el && el.contains(child)),
+          )
+
+          if (options.length === 0) {
+            return { foundList: false, pickedText: '', usedFallback: false, available: [] as string[] }
+          }
+
+          const entries = options.map((el) => ({
+            el: el as HTMLElement,
+            text: ((el as HTMLElement).innerText || el.textContent || '').trim().replace(/\s+/g, ' '),
+          }))
+
+          const desiredLower = desiredModel.toLowerCase()
+          let chosen = entries.find((e) => e.text.toLowerCase().includes(desiredLower))
+          let usedFallback = false
+
+          if (!chosen) {
+            usedFallback = true
+            chosen =
+              entries.find((e) => /gemini\s*3\.8\s*pro/i.test(e.text)) ||
+              entries.find((e) => /3\.8\s*pro/i.test(e.text)) ||
+              entries.find((e) => /gemini\s*3\.8\s*flash/i.test(e.text)) ||
+              entries.find((e) => /3\.8/i.test(e.text)) ||
+              undefined
+          }
+
+          if (chosen) {
+            chosen.el.setAttribute('data-cmt-picked-model', 'true')
+            return {
+              foundList: true,
+              pickedText: chosen.text,
+              usedFallback,
+              available: entries.map((e) => e.text),
+            }
+          }
+
+          return {
+            foundList: true,
+            pickedText: '',
+            usedFallback: false,
+            available: entries.map((e) => e.text),
+          }
+        }, targetModel)
+        .catch(() => ({ foundList: false, pickedText: '', usedFallback: false, available: [] as string[] }))
+
+      let expectedSubstringAfterPick = targetLower
+
+      if (pickResult.pickedText) {
+        const pickedLoc = page.locator('[data-cmt-picked-model="true"]').first()
+        if ((await pickedLoc.count()) > 0) {
+          await pickedLoc.click().catch(() => {})
+        }
+        if (pickResult.usedFallback) {
+          this.logStep(
+            'model fallback',
+            `"${targetModel}" not in list; selected "${pickResult.pickedText}"`,
+            'info',
+          )
+          expectedSubstringAfterPick = /3\.8\s*pro/i.test(pickResult.pickedText)
+            ? '3.8 pro'
+            : /3\.8\s*flash/i.test(pickResult.pickedText)
+              ? '3.8 flash'
+              : '3.8'
+        }
+        await new Promise((r) => setTimeout(r, 450))
+        // Close any leftover dropdown backdrop
+        await page.keyboard.press('Escape').catch(() => {})
+        await new Promise((r) => setTimeout(r, 200))
+      } else {
+        await this.dumpRunSettingsPanelDiagnostics(
+          page,
+          `model option "${targetModel}" (or "3.8") not found in model list (foundList=${pickResult.foundList}, available=${pickResult.available.join(' | ') || 'none'})`,
+        )
+        await page.keyboard.press('Escape').catch(() => {})
+        // If the model list could not be opened or did not contain targetModel, only accept if the visible model card already shows a 3.8 model when targetModel wasn't available
+        if (pickResult.foundList && !pickResult.available.some((a) => a.toLowerCase().includes(targetLower)) && /3\.8/i.test(currentCardText)) {
+          this.logStep(
+            'model fallback',
+            `"${targetModel}" not in list; keeping visible 3.8 model "${currentCardText}"`,
+            'info',
+          )
+          expectedSubstringAfterPick = '3.8'
+        }
+      }
+
+      // READ BACK the visible model card text from the UI
+      const readBackModel = await this.readVisibleModelCardText(page)
+      const readLower = readBackModel.toLowerCase()
+
+      const modelMatched =
+        Boolean(readBackModel) &&
+        (readLower.includes(expectedSubstringAfterPick) ||
+          (expectedSubstringAfterPick.includes('3.8') && readLower.includes('3.8') && pickResult.usedFallback))
+
+      if (modelMatched) {
+        verifiedModelText = readBackModel
+        break
+      }
+
+      modelConfigError = `expected "${targetModel}" (or "${expectedSubstringAfterPick}"), read back "${readBackModel || 'empty'}"`
+      this.logStep(`model retry ${modelAttempt}/2`, modelConfigError, 'warn')
+      await this.dumpRunSettingsPanelDiagnostics(page, `model read-back mismatch: ${modelConfigError}`)
+
+      if (modelAttempt >= 2) {
+        throw new Error(`Studio model config failed: ${modelConfigError}`)
       }
     }
 
@@ -640,38 +1088,96 @@ class StudioBrowserController {
       /* ignore */
     }
 
-    // 3. Thinking Level = High
+    // 3. Set Media Resolution = Low (~65 tokens/frame) using row-scoped selector so it never hits Thinking level
     try {
-      const thinkSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingLevelSelect, 1500)
-      if (thinkSelect) {
-        await thinkSelect.click()
-        await new Promise((r) => setTimeout(r, 250))
-        const highOpt = page.locator('mat-option:has-text("High"), [role="option"]:has-text("High")').first()
-        if ((await highOpt.count()) > 0) {
-          await highOpt.click()
-        } else {
-          await page.keyboard.press('Escape')
+      let resSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.mediaResolutionSelect, 1200)
+      if (!resSelect) {
+        const markedRes = await this.markRowDropdownByLabel(page, '^media\\s+resolution$', 'media-resolution')
+        if (markedRes) {
+          resSelect = page.locator('[data-cmt-row-select="media-resolution"]').first()
+        }
+      }
+      if (resSelect && (await resSelect.count()) > 0) {
+        const currResText = ((await resSelect.innerText().catch(() => '')) || '').trim()
+        if (!/\blow\b/i.test(currResText)) {
+          await resSelect.click()
+          await new Promise((r) => setTimeout(r, 300))
+          const lowOpt = page
+            .locator('mat-option:has-text("Low"), [role="option"]:has-text("Low"), [role="menuitem"]:has-text("Low")')
+            .first()
+          if ((await lowOpt.count()) > 0) {
+            await lowOpt.click()
+          } else {
+            await page.keyboard.press('Escape')
+          }
+          await new Promise((r) => setTimeout(r, 250))
         }
       }
     } catch {
       /* ignore */
     }
 
-    // 4. Media Resolution = Low (~65 tokens/frame, matching API MEDIA_RESOLUTION_LOW)
-    try {
-      const resSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.mediaResolutionSelect, 1500)
-      if (resSelect) {
-        await resSelect.click()
-        await new Promise((r) => setTimeout(r, 250))
-        const lowOpt = page.locator('mat-option:has-text("Low"), [role="option"]:has-text("Low")').first()
-        if ((await lowOpt.count()) > 0) {
-          await lowOpt.click()
-        } else {
-          await page.keyboard.press('Escape')
+    // 4. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
+    let verifiedThinkingText = ''
+    let thinkingConfigError = ''
+
+    for (let thinkAttempt = 1; thinkAttempt <= 2; thinkAttempt++) {
+      await this.waitIfPausedOrThrowIfStopped(scope)
+      thinkingConfigError = ''
+
+      let thinkSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingLevelSelect, 1500)
+      if (!thinkSelect) {
+        const markedThink = await this.markRowDropdownByLabel(
+          page,
+          '^thinking\\s+(level|budget)$',
+          'thinking-level',
+        )
+        if (markedThink) {
+          thinkSelect = page.locator('[data-cmt-row-select="thinking-level"]').first()
         }
       }
-    } catch {
-      /* ignore */
+
+      if (!thinkSelect || (await thinkSelect.count()) === 0) {
+        thinkingConfigError = 'Thinking level dropdown selector not found in Run settings panel'
+        await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
+      } else {
+        const beforeThink = await this.readVisibleThinkingLevelText(page)
+        if (!/\bhigh\b/i.test(beforeThink)) {
+          await thinkSelect.scrollIntoViewIfNeeded().catch(() => {})
+          await thinkSelect.click().catch(() => {})
+          await new Promise((r) => setTimeout(r, 350))
+
+          const highOpt = page
+            .locator(
+              'mat-option:has-text("High"), [role="option"]:has-text("High"), [role="menuitem"]:has-text("High"), .cdk-overlay-pane :text-is("High")',
+            )
+            .first()
+
+          if ((await highOpt.count()) > 0 && (await highOpt.isVisible().catch(() => false))) {
+            await highOpt.click().catch(() => {})
+            await new Promise((r) => setTimeout(r, 350))
+          } else {
+            thinkingConfigError = '"High" option not found after opening Thinking level dropdown'
+            await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
+            await page.keyboard.press('Escape').catch(() => {})
+          }
+        }
+
+        const readBackThink = await this.readVisibleThinkingLevelText(page)
+        if (/\bhigh\b/i.test(readBackThink)) {
+          verifiedThinkingText = readBackThink
+          break
+        }
+        if (!thinkingConfigError) {
+          thinkingConfigError = `expected "High", read back "${readBackThink || 'empty'}"`
+        }
+        await this.dumpRunSettingsPanelDiagnostics(page, `thinking level read-back mismatch: ${thinkingConfigError}`)
+      }
+
+      this.logStep(`thinking retry ${thinkAttempt}/2`, thinkingConfigError, 'warn')
+      if (thinkAttempt >= 2) {
+        throw new Error(`Studio thinking level config failed: ${thinkingConfigError}`)
+      }
     }
 
     // 5. Open Advanced Settings if collapsed -> Max Output Tokens + Safety Settings all OFF
@@ -718,139 +1224,101 @@ class StudioBrowserController {
       /* ignore */
     }
 
-    this.logStep('model set', `${targetModel || 'Default'} · temp=0 · thinking=High · mediaRes=Low · safety=OFF`, 'success')
+    // Final read-back verification before logging success
+    const finalModelReadBack = (await this.readVisibleModelCardText(page)) || verifiedModelText
+    const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
+    if (!/\bhigh\b/i.test(finalThinkingReadBack)) {
+      await this.dumpRunSettingsPanelDiagnostics(
+        page,
+        `final thinking read-back check failed: "${finalThinkingReadBack}"`,
+      )
+      throw new Error(`Studio thinking level config failed: expected "High", read back "${finalThinkingReadBack || 'empty'}"`)
+    }
+
+    this.logStep(
+      'model set',
+      `model="${finalModelReadBack}" · thinking="${finalThinkingReadBack}" · temp=0 · mediaRes=Low · safety=OFF`,
+      'success',
+    )
   }
 
   /**
-   * Synchronize fallback `data-cmt-fallback-chip="true"` markers on attached media chips
-   * when AI Studio's custom element tag names change.
-   * Matches any compact prompt-area chip container that:
-   *  - contains the uploaded filename basename (or .mp4/.mov/.webm) next to a chip button, OR
-   *  - shows "N tokens" (e.g. "5,666 tokens", excluding the "X / 1,048,576 tokens" header) next to a settings/gear button.
+   * Problem 1(a): Detect chips by anchoring on button[aria-label="Edit video options" i]
+   * (and/or button[aria-label="Remove media" i]).
+   * A chip = the nearest ancestor of that button that contains BOTH:
+   *   - exactly one Edit button (button[aria-label="Edit video options" i] / video options)
+   *   - and one Remove button (button[aria-label="Remove media" i]).
+   * Tags each detected chip with `data-cmt-fallback-chip="true"` (keeping ms-* selectors as primary).
+   * No filename or "N tokens" text dependency.
    */
-  private async syncFallbackMediaChips(page: Page, uploadedBasename: string): Promise<void> {
+  private async syncFallbackMediaChips(page: Page, _uploadedBasename?: string): Promise<void> {
     const primarySelector = STUDIO_SELECTORS.videoMediaChips.join(', ')
     await page
-      .evaluate(
-        ({ primarySel, basename }) => {
-          document
-            .querySelectorAll('[data-cmt-fallback-chip]')
-            .forEach((el) => el.removeAttribute('data-cmt-fallback-chip'))
+      .evaluate((primarySel) => {
+        document
+          .querySelectorAll('[data-cmt-fallback-chip]')
+          .forEach((el) => el.removeAttribute('data-cmt-fallback-chip'))
 
-          // If native custom-element selectors already match chips, only tag additional ones not covered
-          const primarySet = new Set<Element>(
-            primarySel ? Array.from(document.querySelectorAll(primarySel)) : [],
+        const primarySet = new Set<Element>(
+          primarySel ? Array.from(document.querySelectorAll(primarySel)) : [],
+        )
+
+        const editBtnSel =
+          'button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i], [role="button"][aria-label*="Edit video options" i]'
+        const removeBtnSel =
+          'button[aria-label="Remove media" i], button[aria-label*="Remove media" i], [role="button"][aria-label*="Remove media" i]'
+
+        const editButtons = Array.from(document.body.querySelectorAll(editBtnSel))
+        const foundChips: Element[] = []
+
+        for (const editBtn of editButtons) {
+          let curr: Element | null = editBtn.parentElement
+          for (let depth = 0; depth < 8 && curr && curr !== document.body; depth++) {
+            const editCount = curr.querySelectorAll(editBtnSel).length
+            const removeCount = curr.querySelectorAll(removeBtnSel).length
+            if (editCount === 1 && removeCount === 1) {
+              if (!foundChips.includes(curr)) {
+                foundChips.push(curr)
+              }
+              break
+            }
+            // If we climbed too high and now contain multiple Edit buttons, stop
+            if (editCount > 1) {
+              break
+            }
+            curr = curr.parentElement
+          }
+        }
+
+        // Fallback if only Remove media + gear icon button exist inside the chip
+        if (foundChips.length === 0) {
+          const removeButtons = Array.from(document.body.querySelectorAll(removeBtnSel))
+          for (const remBtn of removeButtons) {
+            let curr: Element | null = remBtn.parentElement
+            for (let depth = 0; depth < 8 && curr && curr !== document.body; depth++) {
+              const removeCount = curr.querySelectorAll(removeBtnSel).length
+              const allBtns = curr.querySelectorAll('button, [role="button"]').length
+              if (removeCount === 1 && allBtns === 2) {
+                if (!foundChips.includes(curr)) {
+                  foundChips.push(curr)
+                }
+                break
+              }
+              if (removeCount > 1) break
+              curr = curr.parentElement
+            }
+          }
+        }
+
+        for (const chip of foundChips) {
+          const alreadyCovered = Array.from(primarySet).some(
+            (p) => p === chip || p.contains(chip) || chip.contains(p),
           )
-
-          const isExcludedArea = (el: Element): boolean =>
-            Boolean(
-              el.closest(
-                'header, nav, ms-toolbar, ms-header, ms-run-settings, .run-settings, mat-dialog-container, [role="dialog"]',
-              ),
-            )
-
-          const isCloseOrRemoveButton = (btn: Element): boolean => {
-            const label = (
-              (btn.getAttribute('aria-label') || '') +
-              ' ' +
-              (btn.getAttribute('mattooltip') || '') +
-              ' ' +
-              (btn.getAttribute('title') || '') +
-              ' ' +
-              (btn.textContent || '')
-            )
-              .trim()
-              .toLowerCase()
-            return /\b(close|cancel|clear|remove|delete)\b|^×$|^x$/i.test(label)
+          if (!alreadyCovered) {
+            chip.setAttribute('data-cmt-fallback-chip', 'true')
           }
-
-          const isSettingsOrGearButton = (btn: Element): boolean => {
-            if (isCloseOrRemoveButton(btn)) return false
-            const label = (
-              (btn.getAttribute('aria-label') || '') +
-              ' ' +
-              (btn.getAttribute('mattooltip') || '') +
-              ' ' +
-              (btn.getAttribute('title') || '') +
-              ' ' +
-              (btn.textContent || '') +
-              ' ' +
-              (btn.innerHTML || '')
-            ).toLowerCase()
-            if (/\b(run settings|toggle run settings|insert|add|run|stop)\b/i.test(label)) {
-              return false
-            }
-            return (
-              /\b(settings|tune|video_settings|edit|clip|configure|gear|options)\b/i.test(label) ||
-              Boolean(btn.querySelector('mat-icon, svg, span[class*="symbol" i], span[class*="icon" i]'))
-            )
-          }
-
-          const hasChipTokenText = (text: string): boolean => {
-            // Match e.g. "5,666 tokens" but NOT "5,666 / 1,048,576 tokens"
-            if (/[\d,]+\s*\/\s*[\d,]+\s*tokens?/i.test(text)) return false
-            return /\b[1-9][\d,]*\s*tokens?\b/i.test(text)
-          }
-
-          const baseLower = (basename || '').trim().toLowerCase()
-          const hasFilenameText = (text: string): boolean => {
-            const lower = text.toLowerCase()
-            if (baseLower && lower.includes(baseLower)) return true
-            return /\b[\w.-]+\.(mp4|mov|webm|mkv)\b/i.test(lower)
-          }
-
-          const allElements = Array.from(document.body.querySelectorAll('*'))
-          const candidateContainers: HTMLElement[] = []
-
-          for (const node of allElements) {
-            const el = node as HTMLElement
-            if (!el || isExcludedArea(el)) continue
-            if (el.tagName === 'BUTTON' || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue
-
-            const rect = el.getBoundingClientRect()
-            if (rect.width < 30 || rect.width > 900 || rect.height < 14 || rect.height > 180) continue
-            if (el.outerHTML.length > 15000) continue
-
-            const text = (el.innerText || el.textContent || '').trim()
-            if (!text || text.length > 400) continue
-
-            const matchesName = hasFilenameText(text)
-            const matchesTokens = hasChipTokenText(text)
-            if (!matchesName && !matchesTokens) continue
-
-            const buttons = Array.from(el.querySelectorAll('button, [role="button"]'))
-            if (buttons.length === 0) continue
-
-            const hasGear = buttons.some(isSettingsOrGearButton)
-            const hasClose = buttons.some(isCloseOrRemoveButton)
-
-            // Require either:
-            // - "N tokens" next to a settings/gear button, OR
-            // - uploaded filename text + (settings/gear button OR "N tokens" OR both gear + close buttons)
-            const validByTokensAndGear = matchesTokens && hasGear
-            const validByName = matchesName && (hasGear || matchesTokens || (buttons.length >= 2 && hasClose))
-
-            if (validByTokensAndGear || validByName) {
-              candidateContainers.push(el)
-            }
-          }
-
-          // Keep only minimal (innermost) chip containers so each attached video is 1 chip
-          const minimalChips = candidateContainers.filter(
-            (c) => !candidateContainers.some((other) => other !== c && c.contains(other)),
-          )
-
-          for (const chip of minimalChips) {
-            const alreadyCovered = Array.from(primarySet).some(
-              (p) => p === chip || p.contains(chip) || chip.contains(p),
-            )
-            if (!alreadyCovered) {
-              chip.setAttribute('data-cmt-fallback-chip', 'true')
-            }
-          }
-        },
-        { primarySel: primarySelector, basename: uploadedBasename },
-      )
+        }
+      }, primarySelector)
       .catch(() => {})
   }
 
@@ -888,12 +1356,21 @@ class StudioBrowserController {
             .filter((el) => !matching.some((child) => child !== el && el.contains(child)))
             .sort((a, b) => a.outerHTML.length - b.outerHTML.length)[0] || null
 
+        const editBtns = Array.from(
+          document.body.querySelectorAll(
+            'button[aria-label*="Edit video" i], button[aria-label*="Remove media" i], button[aria-label*="video" i]',
+          ),
+        ).map(
+          (b) =>
+            `aria="${b.getAttribute('aria-label') || ''}" text="${(b.textContent || '').trim()}" parent=<${b.parentElement?.tagName.toLowerCase() || ''} class="${b.parentElement?.getAttribute('class') || ''}">`,
+        )
+
         if (!smallest) {
           return {
             found: false,
-            outerHtml: `No element found containing "${basename}". Body text snippet: ${(document.body.innerText || '').slice(0, 600)}`,
+            outerHtml: `No element found containing "${basename}". Video buttons: ${editBtns.join(' | ') || 'none'}. Body snippet: ${(document.body.innerText || '').slice(0, 500)}`,
             ancestors: 'none',
-            buttons: 'none',
+            buttons: editBtns.join(' ; ') || 'none',
           }
         }
 
@@ -922,7 +1399,7 @@ class StudioBrowserController {
           curr = curr.parentElement
         }
 
-        // (c) all button aria-labels inside it (and inside up to 4 ancestor levels so sibling buttons inside the chip are included)
+        // (c) all button aria-labels inside it (and inside up to 4 ancestor levels + page video buttons)
         const searchRoot =
           smallest.parentElement?.parentElement?.parentElement?.parentElement ||
           smallest.parentElement?.parentElement ||
@@ -941,7 +1418,7 @@ class StudioBrowserController {
           outerHtml: combinedOuterHtml,
           ancestors: ancestorDescriptions.join(' -> '),
           buttons:
-            [...btnsInsideSmallest, ...btnsInsideChipRoot].join(' ; ') ||
+            [...btnsInsideSmallest, ...btnsInsideChipRoot, ...editBtns].join(' ; ') ||
             'no buttons found',
         }
       }, uploadedBasename)
@@ -958,22 +1435,33 @@ class StudioBrowserController {
   }
 
   /**
-   * Requirement 3: Dump open Video Settings dialog / overlay DOM when start/end/FPS inputs are not found.
+   * Problem 1(c): Dump open Video Settings dialog / popover DOM + all inputs when start/end/FPS inputs are not found.
    */
   private async dumpVideoDialogDiagnostics(page: Page, label: string, reason: string): Promise<void> {
     try {
       const dump = await page.evaluate(() => {
-        const dialogEl = document.querySelector(
-          'mat-dialog-container, [role="dialog"], .cdk-overlay-pane, .video-settings-container',
-        )
-        const dialogHtml = dialogEl
-          ? dialogEl.outerHTML.slice(0, 3000)
-          : 'No mat-dialog-container / [role="dialog"] / .cdk-overlay-pane found in DOM'
+        // Prioritize non-empty dialog / overlay panes that contain inputs or buttons (skipping empty tooltip panes)
+        const candidates = Array.from(
+          document.querySelectorAll(
+            'mat-dialog-container, [role="dialog"], .cdk-overlay-pane, [class*="video-options" i], [class*="video-settings" i]',
+          ),
+        ).filter((el) => (el.innerHTML || '').trim().length > 0)
+
+        const bestDialog =
+          candidates.find((el) => el.querySelectorAll('input').length > 0) ||
+          candidates[candidates.length - 1] ||
+          null
+
+        const dialogHtml = bestDialog
+          ? bestDialog.outerHTML.slice(0, 3000)
+          : 'No non-empty mat-dialog-container / [role="dialog"] / .cdk-overlay-pane found in DOM'
+
         const inputs = Array.from(document.querySelectorAll('input'))
-          .map(
-            (inp) =>
-              `<input type="${inp.type}" aria-label="${inp.getAttribute('aria-label') || ''}" placeholder="${inp.getAttribute('placeholder') || ''}" value="${inp.value}">`,
-          )
+          .map((inp) => {
+            const fieldLabel =
+              inp.closest('mat-form-field, label, div')?.textContent?.trim().replace(/\s+/g, ' ').slice(0, 60) || ''
+            return `<input type="${inp.type}" id="${inp.id || ''}" name="${inp.name || ''}" aria-label="${inp.getAttribute('aria-label') || ''}" placeholder="${inp.getAttribute('placeholder') || ''}" value="${inp.value}" label="${fieldLabel}">`
+          })
           .join(' | ')
         return { dialogHtml, inputs }
       })
@@ -1020,7 +1508,7 @@ class StudioBrowserController {
     ].join(', ')
     const chipsLocator = page.locator(combinedChipSelector)
 
-    await this.syncFallbackMediaChips(page, '')
+    await this.syncFallbackMediaChips(page)
     const chipsBefore = await chipsLocator.count()
 
     if (youtubeUrl) {
@@ -1127,7 +1615,7 @@ class StudioBrowserController {
     let chipCount = chipsBefore
     while (Date.now() < waitDeadline) {
       await this.waitIfPausedOrThrowIfStopped(scope)
-      await this.syncFallbackMediaChips(page, uploadedBasename)
+      await this.syncFallbackMediaChips(page)
       chipCount = await chipsLocator.count()
       if (chipCount > chipsBefore) break
       await new Promise((r) => setTimeout(r, 500))
@@ -1140,26 +1628,8 @@ class StudioBrowserController {
       )
     }
 
-    // FIX 1b: Target the chip we just added (at index chipsBefore, or matching expected name among newly added chips)
-    const expectedNameHint = uploadedBasename.toLowerCase()
-
-    let targetChipIndex = chipsBefore
-    if (expectedNameHint) {
-      for (let idx = chipsBefore; idx < chipCount; idx++) {
-        const candidate = chipsLocator.nth(idx)
-        const text = (
-          (await candidate.innerText().catch(() => '')) +
-          ' ' +
-          ((await candidate.getAttribute('aria-label').catch(() => '')) || '') +
-          ' ' +
-          ((await candidate.getAttribute('title').catch(() => '')) || '')
-        ).toLowerCase()
-        if (text.includes(expectedNameHint.slice(0, 12))) {
-          targetChipIndex = idx
-          break
-        }
-      }
-    }
+    // Problem 1(d): Target the chip we just added at index chipsBefore (short = 0, movie = 1)
+    const targetChipIndex = chipsBefore
 
     const targetChip = chipsLocator.nth(targetChipIndex)
     if ((await targetChip.count()) === 0) {
@@ -1171,7 +1641,8 @@ class StudioBrowserController {
       throw new Error(`Studio clip config failed: movie chip resolved to index 0 (short video chip)`)
     }
 
-    // FIX 1c: Open Video Settings on targetChip, set start / end / FPS, and READ BACK all three values.
+    // FIX 1c: Open Video Settings on targetChip via button[aria-label="Edit video options"],
+    // set start / end / FPS, and READ BACK all three values.
     // Retry the dialog once if any input is missing or any value did not stick, then THROW.
     const startStr = this.formatClockForStudioInput(startSec)
     const endStr = this.formatClockForStudioInput(endSec)
@@ -1185,7 +1656,7 @@ class StudioBrowserController {
       await targetChip.hover().catch(() => {})
       await new Promise((r) => setTimeout(r, 250))
 
-      // Prefer explicit video settings (gear) button inside the chip; never click the X/remove button
+      // Prefer explicit video settings (gear: button[aria-label="Edit video options"]) inside the chip; NEVER click Remove media
       let openedDialog = false
       for (const btnSel of STUDIO_SELECTORS.videoChipSettingsButton) {
         const btn = targetChip.locator(btnSel).first()
@@ -1196,7 +1667,7 @@ class StudioBrowserController {
         }
       }
       if (!openedDialog) {
-        // Fallback: find the first button inside targetChip that is NOT a close/remove/delete button
+        // Fallback: find the first button inside targetChip that is NOT "Remove media" / close / delete
         const chipButtons = targetChip.locator('button, [role="button"]')
         const btnCount = await chipButtons.count()
         for (let bIdx = 0; bIdx < btnCount; bIdx++) {
@@ -1217,9 +1688,6 @@ class StudioBrowserController {
             openedDialog = true
             break
           }
-        }
-        if (!openedDialog) {
-          await targetChip.click()
         }
       }
       await new Promise((r) => setTimeout(r, 600))

@@ -214,7 +214,7 @@ export async function POST(req: NextRequest) {
                 username,
                 scanId: 'test-clip',
                 jobLabel,
-                modelName: cfg.studioModelName || 'Gemini 2.5 Pro',
+                modelName: cfg.studioModelName || 'Gemini 3.8 Pro',
                 maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
                 maxInputTokens: cfg.studioMaxInputTokens,
                 pageRecycleInterval: cfg.studioPageRecycleInterval,
