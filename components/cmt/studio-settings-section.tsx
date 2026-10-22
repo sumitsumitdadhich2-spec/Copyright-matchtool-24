@@ -22,7 +22,7 @@ interface Props {
 
 export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [engine, setEngine] = useState<'api' | 'studio'>(studio?.chunkScanEngine ?? 'api')
-  const [modelName, setModelName] = useState(studio?.studioModelName ?? 'Gemini 2.5 Pro')
+  const [modelName, setModelName] = useState(studio?.studioModelName ?? 'Gemini 3.8 Flash')
   const [maxOutputTokens, setMaxOutputTokens] = useState(studio?.studioMaxOutputTokens ?? 65536)
   const [maxInputTokensStr, setMaxInputTokensStr] = useState<string>(
     studio?.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '',
@@ -467,7 +467,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
                 type="text"
                 value={modelName}
                 onChange={(e) => setModelName(e.target.value)}
-                placeholder="Gemini 2.5 Pro"
+                placeholder="Gemini 3.8 Flash"
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
               />
             </label>

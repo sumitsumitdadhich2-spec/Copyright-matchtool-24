@@ -53,6 +53,7 @@ export const STUDIO_SELECTORS = {
   /** Right-side Run Settings panel toggle (if collapsed) */
   runSettingsToggle: [
     'button[aria-label="Toggle run settings panel" i]',
+    'button.runsettings-toggle-button',
     'button[aria-label*="Toggle run settings" i]',
     'button[aria-label*="Run settings" i]',
     'button[mattooltip*="Run settings" i]',
@@ -68,7 +69,8 @@ export const STUDIO_SELECTORS = {
     'ms-model-selector',
     '[data-test-id="model-selector"]',
     '[data-test-id*="model-selector" i]',
-    'button[aria-label*="Model" i]',
+    'button[aria-label*="Select model" i]',
+    'button[aria-label*="Model selector" i]',
     'mat-select[aria-label*="Model" i]',
     '.model-selector-trigger',
     '.model-selector-card',
@@ -76,7 +78,9 @@ export const STUDIO_SELECTORS = {
 
   /** Model search input or option list inside model picker */
   modelSearchInput: [
+    'input[placeholder*="Search for a model" i]',
     'input[placeholder*="Search models" i]',
+    'input[aria-label*="Search for a model" i]',
     'input[aria-label*="Search models" i]',
     'input[placeholder*="Search" i]',
     '.mat-mdc-select-panel input',
@@ -140,14 +144,15 @@ export const STUDIO_SELECTORS = {
   ],
 
   safetyModalClose: [
-    'mat-dialog-container button[aria-label*="Close" i]',
     'mat-dialog-container button:has-text("Save")',
-    'mat-dialog-container button:has-text("Close")',
     'mat-dialog-container button:has-text("Done")',
+    'mat-dialog-container button[aria-label*="Close" i]',
+    'mat-dialog-container button:has-text("Close")',
   ],
 
   /** Max output tokens input in Advanced Settings */
   maxOutputTokensInput: [
+    'input[aria-label*="Output length" i]',
     'input[aria-label*="Output token" i]',
     'input[aria-label*="Max output" i]',
     '[data-test-id*="output-length" i] input',
@@ -284,39 +289,49 @@ export const STUDIO_SELECTORS = {
 
   /** Inside Video Settings popover/dialog: Start time, End time, FPS inputs */
   videoStartTimeInput: [
+    '[data-cmt-video-input="start"]',
     'input[aria-label*="Start time" i]',
     'input[aria-label*="Start offset" i]',
     'input[aria-label*="Start" i]',
+    'mat-form-field:has-text("Start Time") input',
     'mat-form-field:has-text("Start") input',
+    'div:has(> label:has-text("Start Time")) input',
     'div:has(> label:has-text("Start")) input',
+    'div:has(> span:has-text("Start Time")) input',
     'div:has(> span:has-text("Start")) input',
     'label:has-text("Start") input',
-    ':nth-match(mat-dialog-container input:not([type="number"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 1)',
-    ':nth-match([role="dialog"] input:not([type="number"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 1)',
-    ':nth-match(.cdk-overlay-pane input:not([type="number"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 1)',
+    ':nth-match(mat-dialog-container input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 1)',
+    ':nth-match([role="dialog"] input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 1)',
+    ':nth-match(.cdk-overlay-pane input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 1)',
     '.video-settings-container input:nth-of-type(1)',
   ],
 
   videoEndTimeInput: [
+    '[data-cmt-video-input="end"]',
     'input[aria-label*="End time" i]',
     'input[aria-label*="End offset" i]',
     'input[aria-label*="End" i]',
+    'mat-form-field:has-text("End Time") input',
     'mat-form-field:has-text("End") input',
+    'div:has(> label:has-text("End Time")) input',
     'div:has(> label:has-text("End")) input',
+    'div:has(> span:has-text("End Time")) input',
     'div:has(> span:has-text("End")) input',
     'label:has-text("End") input',
-    ':nth-match(mat-dialog-container input:not([type="number"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 2)',
-    ':nth-match([role="dialog"] input:not([type="number"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 2)',
-    ':nth-match(.cdk-overlay-pane input:not([type="number"]):not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 2)',
+    ':nth-match(mat-dialog-container input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 2)',
+    ':nth-match([role="dialog"] input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 2)',
+    ':nth-match(.cdk-overlay-pane input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 2)',
     '.video-settings-container input:nth-of-type(2)',
   ],
 
   videoFpsInput: [
+    '[data-cmt-video-input="fps"]',
+    'input[placeholder*="Defaults to 1 FPS" i]',
+    'input[placeholder*="FPS" i]',
     'input[aria-label*="FPS" i]',
     'input[aria-label*="Frame rate" i]',
     'input[aria-label*="frames per second" i]',
     'input[aria-label*="Sampling" i]',
-    'input[placeholder*="FPS" i]',
     'input[type="number"][aria-label*="frame" i]',
     'mat-form-field:has-text("FPS") input',
     'mat-form-field:has-text("Frame") input',
@@ -324,9 +339,6 @@ export const STUDIO_SELECTORS = {
     'div:has(> label:has-text("Frame")) input',
     'div:has(> span:has-text("FPS")) input',
     'label:has-text("FPS") input',
-    'mat-dialog-container input[type="number"]',
-    '[role="dialog"] input[type="number"]',
-    '.cdk-overlay-pane input[type="number"]',
     ':nth-match(mat-dialog-container input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 3)',
     ':nth-match([role="dialog"] input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 3)',
     ':nth-match(.cdk-overlay-pane input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([type="range"]), 3)',
@@ -334,23 +346,18 @@ export const STUDIO_SELECTORS = {
   ],
 
   videoSettingsSaveButton: [
+    '[data-cmt-video-save="true"]',
     'mat-dialog-container button:has-text("Save")',
+    '[role="dialog"] button:has-text("Save")',
+    '.cdk-overlay-pane button:has-text("Save")',
+    'button[aria-label*="Save video settings" i]',
     'mat-dialog-container button:has-text("Apply")',
     'mat-dialog-container button:has-text("Done")',
     'mat-dialog-container button:has-text("Confirm")',
-    'mat-dialog-container button:has-text("OK")',
-    '[role="dialog"] button:has-text("Save")',
     '[role="dialog"] button:has-text("Apply")',
     '[role="dialog"] button:has-text("Done")',
-    '[role="dialog"] button:has-text("Close")',
-    'button[aria-label*="Save video settings" i]',
-    '.cdk-overlay-pane button:has-text("Save")',
     '.cdk-overlay-pane button:has-text("Apply")',
     '.cdk-overlay-pane button:has-text("Done")',
-    '.cdk-overlay-pane button:has-text("Close")',
-    'mat-dialog-container button[aria-label*="Close" i]',
-    '[role="dialog"] button[aria-label*="Close" i]',
-    '.cdk-overlay-pane button[aria-label*="Close" i]',
   ],
 
   /** Token count display in Studio header / Run button area */

@@ -533,18 +533,20 @@ class StudioBrowserController {
 
   private formatClockForStudioInput(sec: number): string {
     const total = Math.max(0, Math.floor(sec))
+    if (total === 0) return '0s'
     const h = Math.floor(total / 3600)
     const m = Math.floor((total % 3600) / 60)
     const s = total % 60
-    if (h > 0) {
-      return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
-    }
-    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
+    const parts: string[] = []
+    if (h > 0) parts.push(`${h}h`)
+    if (m > 0) parts.push(`${m}m`)
+    if (s > 0) parts.push(`${s}s`)
+    return parts.join('')
   }
 
   /**
    * Parse a clock/time string read back from Studio's video settings input
-   * (e.g. "05:00", "1:05:00", "300", "05m 00s") into seconds.
+   * (e.g. "0s", "5m", "1m10s", "05:00", "1:05:00", "300", "05m 00s") into seconds.
    */
   private parseStudioClockToSec(raw: string | null | undefined): number | null {
     if (!raw) return null
@@ -561,7 +563,7 @@ class StudioBrowserController {
       }
     }
 
-    // e.g. "5m 30s" or "120s"
+    // e.g. "5m 30s", "1m10s", "5m", "0s", "120s"
     const msMatch = str.match(/^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s?)?$/i)
     if (msMatch && (msMatch[1] || msMatch[2] || msMatch[3])) {
       const h = msMatch[1] ? Number(msMatch[1]) : 0
@@ -577,44 +579,74 @@ class StudioBrowserController {
   }
 
   /**
-  /**
    * Problem 2(d): Dump the Run Settings panel HTML + controls to the step log when
    * model list / thinking level dropdown selectors are not found or verification fails.
    */
   private async dumpRunSettingsPanelDiagnostics(page: Page, reason: string): Promise<void> {
     try {
       const dump = await page.evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
         const panelCandidates = Array.from(
           document.querySelectorAll(
-            'ms-run-settings, [class*="run-settings" i], aside, .right-side-panel, [data-test-id*="run-settings" i]',
+            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i]), aside, .right-side-panel, [data-test-id*="run-settings" i], [data-test-id*="runsettings" i]',
           ),
-        )
-        const panelEl =
-          panelCandidates.find((el) => (el as HTMLElement).offsetParent !== null) ||
-          panelCandidates[0] ||
-          null
+        ).filter((el) => {
+          if (!isVisible(el)) return false
+          const r = el.getBoundingClientRect()
+          return r.width >= 140 && r.height >= 100
+        })
 
-        const overlayPanes = Array.from(document.querySelectorAll('.cdk-overlay-pane, [role="listbox"], [role="menu"], [role="dialog"]'))
+        let panelEl: HTMLElement | null = (panelCandidates[0] as HTMLElement | undefined) || null
+        if (!panelEl) {
+          // Fallback: find any right-side container holding Run Settings controls
+          const rightContainers = Array.from(document.body.querySelectorAll('div, section, aside')).filter((el) => {
+            if (!isVisible(el)) return false
+            const r = el.getBoundingClientRect()
+            return (
+              r.left >= window.innerWidth * 0.45 &&
+              r.width >= 180 &&
+              r.width <= 650 &&
+              r.height >= 220 &&
+              /temperature|thinking|safety|resolution|token|system\s+instructions/i.test(
+                (el as HTMLElement).innerText || '',
+              )
+            )
+          })
+          panelEl = (rightContainers[0] as HTMLElement) || null
+        }
+
+        const overlayPanes = Array.from(
+          document.querySelectorAll('.cdk-overlay-pane, [role="listbox"], [role="menu"], [role="dialog"]'),
+        )
           .filter((el) => (el.textContent || '').trim().length > 0)
           .map((el) => el.outerHTML.slice(0, 1500))
           .join(' || ')
 
         const panelHtml = panelEl
           ? panelEl.outerHTML.slice(0, 3000)
-          : `No ms-run-settings panel found. Body snippet: ${(document.body.innerText || '').slice(0, 800)}`
+          : `No run-settings panel open. Body snippet: ${(document.body.innerText || '').slice(0, 800)}`
 
         const controls = Array.from(
           (panelEl || document.body).querySelectorAll(
-            'button, mat-select, [role="combobox"], [role="listbox"], [role="option"], mat-option, input',
+            'ms-model-selector, button, mat-select, [role="combobox"], [role="listbox"], [role="option"], mat-option, mat-slide-toggle, input',
           ),
         )
-          .slice(0, 40)
+          .slice(0, 45)
           .map((c) => {
             const tag = c.tagName.toLowerCase()
             const aria = c.getAttribute('aria-label') || ''
             const role = c.getAttribute('role') || ''
             const cls = (c.getAttribute('class') || '').slice(0, 60)
-            const txt = ((c as HTMLElement).innerText || c.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 80)
+            const txt = ((c as HTMLElement).innerText || c.textContent || '')
+              .trim()
+              .replace(/\s+/g, ' ')
+              .slice(0, 80)
             return `<${tag}${role ? ` role="${role}"` : ''}${aria ? ` aria="${aria}"` : ''}${cls ? ` class="${cls}"` : ''}>"${txt}"`
           })
           .join(' ; ')
@@ -642,7 +674,176 @@ class StudioBrowserController {
   }
 
   /**
+   * Check whether the right-hand Run Settings panel is currently open and visible.
+   * Note: Gemini 3.8 Flash does NOT have a "Temperature" field in Run Settings —
+   * it shows "Run settings", "System instructions", "Thinking level", "Media resolution", "Output length".
+   */
+  private async isRunSettingsPanelOpen(page: Page): Promise<boolean> {
+    try {
+      return await page.evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        const containers = Array.from(
+          document.querySelectorAll(
+            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i]), ms-model-selector',
+          ),
+        )
+        for (const c of containers) {
+          if (!isVisible(c)) continue
+          const tag = c.tagName.toLowerCase()
+          if (tag === 'button') continue
+          const r = c.getBoundingClientRect()
+          if (r.width >= 150 && r.height >= 60) return true
+        }
+
+        const bodyText = document.body.innerText || ''
+        if (
+          /thinking\s+level/i.test(bodyText) ||
+          /media\s+resolution/i.test(bodyText) ||
+          /output\s+length/i.test(bodyText) ||
+          (/system\s+instructions/i.test(bodyText) && /run\s+settings/i.test(bodyText)) ||
+          (/temperature/i.test(bodyText) && /run\s+settings/i.test(bodyText))
+        ) {
+          return true
+        }
+        return false
+      })
+    } catch {
+      return false
+    }
+  }
+
+  /**
+   * Dismiss any open dropdown / menu overlay (.cdk-overlay-backdrop) WITHOUT accidentally closing
+   * the Run Settings panel via an unnecessary Escape press.
+   */
+  private async dismissOpenOverlayIfAny(page: Page): Promise<void> {
+    try {
+      const closedViaBackdrop = await page.evaluate(() => {
+        const backdrop = document.querySelector('.cdk-overlay-backdrop.cdk-overlay-backdrop-showing') as HTMLElement | null
+        if (backdrop) {
+          backdrop.click()
+          return true
+        }
+        const activeOverlay = document.querySelector(
+          '.cdk-overlay-pane [role="menu"], .cdk-overlay-pane [role="listbox"], .cdk-overlay-pane mat-option',
+        ) as HTMLElement | null
+        if (activeOverlay && activeOverlay.getBoundingClientRect().height > 0) {
+          return false // needs Escape
+        }
+        return true // nothing open
+      })
+      if (!closedViaBackdrop) {
+        await page.keyboard.press('Escape').catch(() => {})
+      }
+      await new Promise((r) => setTimeout(r, 200))
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
+   * Ensure the right-hand Run Settings panel is open.
+   * Never clicks the toggle button if the panel is already open; if closed, clicks
+   * `button[aria-label="Toggle run settings panel"]` (`button.runsettings-toggle-button`)
+   * and polls until the panel is visibly open.
+   */
+  private async ensureRunSettingsPanelOpen(page: Page): Promise<boolean> {
+    if (await this.isRunSettingsPanelOpen(page)) return true
+    await new Promise((r) => setTimeout(r, 300))
+    if (await this.isRunSettingsPanelOpen(page)) return true
+
+    await this.dismissOpenOverlayIfAny(page)
+    if (await this.isRunSettingsPanelOpen(page)) return true
+
+    const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2500)
+    if (toggle) {
+      await toggle.click().catch(() => {})
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 250))
+        if (await this.isRunSettingsPanelOpen(page)) return true
+      }
+    }
+
+    // Second attempt via direct DOM click on button.runsettings-toggle-button
+    const clickedDom = await page
+      .evaluate(() => {
+        const btn = document.querySelector(
+          'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button, button[aria-label*="Run settings" i]',
+        ) as HTMLElement | null
+        if (btn) {
+          btn.click()
+          return true
+        }
+        return false
+      })
+      .catch(() => false)
+
+    if (clickedDom) {
+      for (let i = 0; i < 10; i++) {
+        await new Promise((r) => setTimeout(r, 250))
+        if (await this.isRunSettingsPanelOpen(page)) return true
+      }
+    }
+
+    return await this.isRunSettingsPanelOpen(page)
+  }
+
+  /**
+   * Close the Run Settings panel after configuring model & thinking level so it does not cover
+   * the prompt composer or the Run button (as shown at 01:42-01:48 in the user's video).
+   */
+  private async closeRunSettingsPanel(page: Page): Promise<void> {
+    try {
+      await this.dismissOpenOverlayIfAny(page)
+      if (!(await this.isRunSettingsPanelOpen(page))) return
+
+      await page
+        .evaluate(() => {
+          const isVisible = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          }
+
+          // 1. Try the close (X) button at the top-right of the Run settings panel header
+          const closeBtns = Array.from(
+            document.querySelectorAll(
+              'button[aria-label*="Close run settings" i], button[aria-label="Close panel" i], button[aria-label="Close" i]',
+            ),
+          )
+          for (const b of closeBtns) {
+            if (isVisible(b) && b.getBoundingClientRect().left > window.innerWidth * 0.45) {
+              ;(b as HTMLElement).click()
+              return
+            }
+          }
+
+          // 2. Fallback: click the tune toggle button in the top toolbar
+          const toggleBtn = document.querySelector(
+            'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button',
+          ) as HTMLElement | null
+          if (toggleBtn && isVisible(toggleBtn)) {
+            toggleBtn.click()
+          }
+        })
+        .catch(() => {})
+
+      await new Promise((r) => setTimeout(r, 350))
+    } catch {
+      /* ignore */
+    }
+  }
+
+  /**
    * Read the currently visible model card text at the top of the Run Settings panel.
+   * Excludes the center-page welcome heading ("Start building with Gemini 3.8 Flash").
    */
   private async readVisibleModelCardText(page: Page): Promise<string> {
     try {
@@ -654,25 +855,47 @@ class StudioBrowserController {
           return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
         }
 
+        const isWelcomeHeading = (txt: string) => /^start\s+building\s+with\b/i.test(txt)
+
         for (const sel of triggerSels) {
           const nodes = Array.from(document.querySelectorAll(sel))
           for (const node of nodes) {
             if (!isVisible(node)) continue
             const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
-            if (t && /gemini/i.test(t)) return t
+            if (t && !isWelcomeHeading(t) && (/gemini/i.test(t) || /3\.8/i.test(t) || /2\.5/i.test(t))) {
+              return t
+            }
           }
         }
 
-        // Fallback: search inside the Run Settings panel for the top card/button showing "Gemini ..."
+        // Search inside the Run Settings panel (or right-hand panel region) for the model card
         const panelRoot =
-          document.querySelector('ms-run-settings, [class*="run-settings" i], aside') || document.body
-        const all = Array.from(panelRoot.querySelectorAll('ms-model-selector, button, a, [role="button"], div, span'))
+          (Array.from(
+            document.querySelectorAll(
+              'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i])',
+            ),
+          ).find((el) => isVisible(el) && el.getBoundingClientRect().width >= 150) as HTMLElement | undefined) ||
+          null
+
+        const searchRoot = panelRoot || document.body
+        const all = Array.from(
+          searchRoot.querySelectorAll(
+            'ms-model-selector, [class*="model-selector" i], [data-test-id*="model" i], button, a, [role="button"], [role="combobox"], div, span',
+          ),
+        )
         for (const node of all) {
           if (!isVisible(node)) continue
           const r = node.getBoundingClientRect()
-          if (r.height > 140 || r.width > 550) continue
+          // If searching document.body, restrict to right-hand Run Settings area and exclude center welcome card
+          if (!panelRoot && r.left < window.innerWidth * 0.45) continue
+          if (r.height > 150 || r.width > 550 || r.width < 40) continue
           const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
-          if (/^gemini\s+\d+(\.\d+)?/i.test(t) || /\bgemini\s+3\.8\b/i.test(t) || /\bgemini\s+2\.5\b/i.test(t)) {
+          if (!t || isWelcomeHeading(t)) continue
+          if (
+            /^gemini[\s-]+\d+(\.\d+)?/i.test(t) ||
+            /\bgemini[\s-]+3\.8\b/i.test(t) ||
+            /\bgemini[\s-]+2\.5\b/i.test(t)
+          ) {
             return t
           }
         }
@@ -705,27 +928,36 @@ class StudioBrowserController {
           }
         }
 
-        // Row-scoped lookup: find the compact row containing "Thinking level" and read its dropdown/button value
+        // Row-scoped lookup: find the compact row containing "Thinking level" (or "Thinking budget") and read its dropdown/button/selected value
         const all = Array.from(document.body.querySelectorAll('*'))
         const labelNodes = all.filter((el) => {
           if (!isVisible(el)) return false
           const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
-          return /^thinking\s+level$/i.test(t)
+          return /^thinking\s+(level|budget)$/i.test(t)
         })
 
         for (const lbl of labelNodes) {
           let row: Element | null = lbl.parentElement
-          for (let depth = 0; depth < 5 && row; depth++) {
+          for (let depth = 0; depth < 6 && row; depth++) {
             const r = row.getBoundingClientRect()
-            if (r.height <= 140 && r.width <= 600) {
-              const ctrl = row.querySelector(
-                'mat-select, [role="combobox"], button[aria-haspopup], select, .mat-mdc-select-value, button',
+            if (r.height >= 18 && r.height <= 160 && r.width <= 600) {
+              // Check for active/checked segmented button first (if rendered as Low/Medium/High buttons)
+              const pressedBtn = row.querySelector(
+                'button[aria-pressed="true"], button[aria-selected="true"], .mat-button-toggle-checked, [class*="active" i][role="button"], [class*="selected" i] button',
               ) as HTMLElement | null
-              if (ctrl && isVisible(ctrl)) {
+              if (pressedBtn && isVisible(pressedBtn)) {
+                const pVal = (pressedBtn.innerText || pressedBtn.textContent || '').trim().replace(/\s+/g, ' ')
+                if (pVal) return pVal
+              }
+
+              const ctrl = row.querySelector(
+                'mat-select, [role="combobox"], button[aria-haspopup], select, .mat-mdc-select-value, .mat-mdc-select-trigger, button:not([aria-label*="info" i]):not([aria-label*="help" i]):not([role="switch"])',
+              ) as HTMLElement | null
+              if (ctrl && isVisible(ctrl) && ctrl !== lbl && !ctrl.contains(lbl)) {
                 const val = (ctrl.innerText || ctrl.textContent || (ctrl as HTMLInputElement).value || '')
                   .trim()
                   .replace(/\s+/g, ' ')
-                if (val && !/^thinking\s+level$/i.test(val)) {
+                if (val && !/^thinking\s+(level|budget)$/i.test(val)) {
                   return val
                 }
               }
@@ -768,17 +1000,18 @@ class StudioBrowserController {
           const all = Array.from(document.body.querySelectorAll('*'))
           const labelLeaves = all.filter((el) => {
             if (!isVisible(el)) return false
+            if (el.children.length > 2) return false
             const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
             return re.test(t) && t.length <= 40
           })
 
           for (const leaf of labelLeaves) {
             let row: Element | null = leaf.parentElement
-            for (let depth = 0; depth < 5 && row; depth++) {
+            for (let depth = 0; depth < 6 && row; depth++) {
               const r = row.getBoundingClientRect()
-              if (r.height >= 18 && r.height <= 150 && r.width <= 600) {
+              if (r.height >= 18 && r.height <= 165 && r.width <= 600) {
                 const ctrl = row.querySelector(
-                  'mat-select, [role="combobox"], button[aria-haspopup], select, button:not([aria-label*="info" i]):not([aria-label*="help" i])',
+                  'mat-select, [role="combobox"], button[aria-haspopup], select, .mat-mdc-select-trigger, button:not([aria-label*="info" i]):not([aria-label*="help" i]):not([role="switch"])',
                 ) as HTMLElement | null
                 if (ctrl && isVisible(ctrl) && ctrl !== leaf && !ctrl.contains(leaf)) {
                   ctrl.setAttribute('data-cmt-row-select', marker)
@@ -798,11 +1031,9 @@ class StudioBrowserController {
   }
 
   /**
-   * Step (b): Configure model name (default 'Gemini 3.8 Pro', fallback to first '3.8' entry),
-   * Thinking level = High, temperature = 0, max output tokens, media resolution = Low,
-   * and safety settings all OFF.
-   * Reads back visible model card text and thinking level dropdown text to verify, retries once,
-   * dumps panel HTML if selectors are missing, and THROWS if either fails verification.
+   * Step (b): Configure model name (default 'Gemini 3.8 Flash', excluding TTS),
+   * Thinking level = High, media resolution = Low/Medium, max output tokens,
+   * and safety settings all OFF. Then close the Run Settings panel so the prompt area is unobstructed.
    */
   private async configureRunSettings(
     page: Page,
@@ -811,70 +1042,108 @@ class StudioBrowserController {
   ) {
     await this.waitIfPausedOrThrowIfStopped(scope)
 
-    // 0. Ensure Run Settings panel is open (button[aria-label="Toggle run settings panel"], icon "tune")
-    const isPanelAlreadyOpen = await page
-      .evaluate(() => {
-        const panel = document.querySelector('ms-run-settings, [class*="run-settings" i]') as HTMLElement | null
-        if (panel && panel.getBoundingClientRect().width > 40) return true
-        const bodyText = document.body.innerText || ''
-        return /thinking\s+level/i.test(bodyText) && /temperature/i.test(bodyText)
-      })
-      .catch(() => false)
-
-    if (!isPanelAlreadyOpen) {
-      const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2500)
-      if (toggle) {
-        await toggle.click().catch(() => {})
-        await new Promise((r) => setTimeout(r, 500))
-      } else {
-        await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings toggle button not found')
-      }
+    // 0. Ensure Run Settings panel is open (without closing it if already open!)
+    const panelOpened = await this.ensureRunSettingsPanelOpen(page)
+    if (!panelOpened) {
+      await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings panel did not open after clicking toggle')
     }
 
-    // 1. Select Model (prefer configured studioModelName, default 'Gemini 3.8 Pro'; fallback to 'Gemini 3.8 Pro' -> 'Gemini 3.8 Flash' -> first '3.8' entry)
-    const targetModel = (config.modelName || 'Gemini 3.8 Pro').trim()
+    // 1. Select Model (prefer configured studioModelName, default 'Gemini 3.8 Flash'; never pick TTS)
+    const rawTargetModel = (config.modelName || 'Gemini 3.8 Flash').trim()
+    const targetModel =
+      rawTargetModel === 'Gemini 2.5 Pro' || rawTargetModel === 'Gemini 3.8 Pro'
+        ? 'Gemini 3.8 Flash'
+        : rawTargetModel
     let verifiedModelText = ''
     let modelConfigError = ''
+
+    const normalizeModelStr = (s: string) =>
+      s
+        .toLowerCase()
+        .replace(/[-_]+/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim()
 
     for (let modelAttempt = 1; modelAttempt <= 2; modelAttempt++) {
       await this.waitIfPausedOrThrowIfStopped(scope)
       modelConfigError = ''
 
-      const currentCardText = await this.readVisibleModelCardText(page)
-      const targetLower = targetModel.toLowerCase()
+      await this.ensureRunSettingsPanelOpen(page)
 
-      // Check if current model card already matches the exact requested model (e.g. "Gemini 3.8 Pro")
-      if (currentCardText && currentCardText.toLowerCase().includes(targetLower)) {
+      const currentCardText = await this.readVisibleModelCardText(page)
+      const targetNorm = normalizeModelStr(targetModel)
+      const currentNorm = normalizeModelStr(currentCardText)
+
+      // Check if current model card in Run Settings already matches "Gemini 3.8 Flash" (and is NOT "Gemini 3.8 Flash TTS")
+      if (
+        currentNorm &&
+        !/\btts\b/i.test(currentNorm) &&
+        (currentNorm.includes(targetNorm) ||
+          (targetNorm.includes('3.8 flash') && /3\.8\s*flash/i.test(currentNorm)))
+      ) {
         verifiedModelText = currentCardText
+        this.logStep('model verified', `Run settings model already set to "${currentCardText}"`, 'info')
         break
       }
 
-      // Click the model card at the top of the Run Settings panel (or its 3-dot / trigger button) to open the model list
+      // Click the model selector card at the top of the Run Settings panel to open the Model Selection view
       let clickedTrigger = false
-      const triggerLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2000)
+      const triggerLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 1800)
       if (triggerLoc) {
+        await triggerLoc.scrollIntoViewIfNeeded().catch(() => {})
         await triggerLoc.click().catch(() => {})
         clickedTrigger = true
       } else {
-        // Fallback: find the visible model card / button at top of Run Settings panel showing "Gemini ..."
+        // Fallback: find the visible model card / button inside the Run Settings panel (right side of viewport, never the top toolbar or center welcome text)
         const markedCard = await page
           .evaluate(() => {
             document
               .querySelectorAll('[data-cmt-model-card]')
               .forEach((el) => el.removeAttribute('data-cmt-model-card'))
-            const root =
-              document.querySelector('ms-run-settings, [class*="run-settings" i], aside') || document.body
+
+            const isVisible = (el: Element | null): el is HTMLElement => {
+              if (!el) return false
+              const h = el as HTMLElement
+              const r = h.getBoundingClientRect()
+              return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+            }
+
+            const panelRoot =
+              (Array.from(
+                document.querySelectorAll(
+                  'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i])',
+                ),
+              ).find((el) => isVisible(el) && el.getBoundingClientRect().width >= 150) as HTMLElement | undefined) ||
+              null
+
+            const searchRoot = panelRoot || document.body
             const candidates = Array.from(
-              root.querySelectorAll('ms-model-selector, button, [role="button"], [role="combobox"], div'),
+              searchRoot.querySelectorAll(
+                'ms-model-selector, [class*="model-selector" i], [data-test-id*="model" i], button, [role="button"], [role="combobox"], a, div',
+              ),
             )
             for (const c of candidates) {
               const el = c as HTMLElement
+              if (!isVisible(el)) continue
               const r = el.getBoundingClientRect()
-              if (r.width < 40 || r.width > 550 || r.height < 20 || r.height > 130) continue
-              const t = (el.innerText || el.textContent || '').trim()
-              if (/gemini\s+\d+(\.\d+)?/i.test(t)) {
-                // Prefer a button inside or the card itself
-                const btn = el.querySelector('button, [role="button"]') as HTMLElement | null
+              if (!panelRoot && r.left < window.innerWidth * 0.45) continue
+              if (r.width < 40 || r.width > 550 || r.height < 20 || r.height > 150) continue
+              const aria = (el.getAttribute('aria-label') || '').toLowerCase()
+              if (
+                aria.includes('view more actions') ||
+                aria.includes('toggle run settings') ||
+                aria.includes('reset settings') ||
+                aria.includes('get sdk') ||
+                aria.includes('get code')
+              ) {
+                continue
+              }
+              const t = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
+              if (/^start\s+building\s+with\b/i.test(t)) continue
+              if (/gemini[\s-]+\d+(\.\d+)?/i.test(t)) {
+                const btn = el.querySelector(
+                  'button:not([aria-label*="View more actions" i]):not([aria-label*="Toggle run settings" i]), [role="button"], [role="combobox"]',
+                ) as HTMLElement | null
                 ;(btn || el).setAttribute('data-cmt-model-card', 'true')
                 return true
               }
@@ -886,6 +1155,7 @@ class StudioBrowserController {
         if (markedCard) {
           const fallbackCard = page.locator('[data-cmt-model-card="true"]').first()
           if ((await fallbackCard.count()) > 0) {
+            await fallbackCard.scrollIntoViewIfNeeded().catch(() => {})
             await fallbackCard.click().catch(() => {})
             clickedTrigger = true
           }
@@ -894,56 +1164,10 @@ class StudioBrowserController {
 
       await new Promise((r) => setTimeout(r, 500))
 
-      // Check if model list options are visible; if not, try clicking any 3-dot / more / chevron button on the model card
-      const countVisibleOptions = async () =>
-        page
-          .locator(
-            'mat-option, [role="option"], [role="menuitem"], ms-model-option, .model-option, .cdk-overlay-pane [class*="model" i]',
-          )
-          .count()
-          .catch(() => 0)
-
-      if ((await countVisibleOptions()) === 0) {
-        const moreClicked = await page
-          .evaluate(() => {
-            const root =
-              document.querySelector('ms-model-selector, [data-cmt-model-card="true"], ms-run-settings') ||
-              document.body
-            const btns = Array.from(root.querySelectorAll('button, [role="button"]'))
-            for (const b of btns) {
-              const el = b as HTMLElement
-              const r = el.getBoundingClientRect()
-              if (r.width <= 0 || r.height <= 0 || r.top > 300) continue
-              const meta = (
-                (el.getAttribute('aria-label') || '') +
-                ' ' +
-                (el.getAttribute('mattooltip') || '') +
-                ' ' +
-                (el.textContent || '')
-              ).toLowerCase()
-              if (/model|more_vert|more_horiz|expand_more|arrow_drop_down|chevron|switch|change/i.test(meta)) {
-                el.click()
-                return true
-              }
-            }
-            return false
-          })
-          .catch(() => false)
-        if (moreClicked) {
-          clickedTrigger = true
-          await new Promise((r) => setTimeout(r, 500))
-        }
-      }
-
-      if (!clickedTrigger) {
-        await this.dumpRunSettingsPanelDiagnostics(page, `model selector trigger not found (attempt ${modelAttempt}/2)`)
-      }
-
-      // Inspect options in the opened model list and click the best match:
-      // 1) exact/substring match for targetModel (e.g. "Gemini 3.8 Pro")
-      // 2) "Gemini 3.8 Pro"
-      // 3) "Gemini 3.8 Flash"
-      // 4) first entry containing "3.8"
+      // Inspect options in the opened "Model selection" panel / overlay and click the best match:
+      // 1) "Gemini 3.8 Flash" / "gemini-3.8-flash" (excluding "TTS")
+      // 2) exact/substring match for targetModel (excluding "TTS")
+      // 3) first entry containing "3.8" (excluding "TTS")
       const pickResult = await page
         .evaluate((desiredModel) => {
           const isVisible = (el: Element): el is HTMLElement => {
@@ -952,21 +1176,38 @@ class StudioBrowserController {
             return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
           }
 
+          const norm = (s: string) =>
+            s
+              .toLowerCase()
+              .replace(/[-_]+/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+
           document
             .querySelectorAll('[data-cmt-picked-model]')
             .forEach((el) => el.removeAttribute('data-cmt-picked-model'))
 
           const rawOptions = Array.from(
             document.querySelectorAll(
-              'mat-option, [role="option"], [role="menuitem"], ms-model-option, .model-option, .cdk-overlay-pane button, .cdk-overlay-pane [role="button"], .cdk-overlay-pane div[class*="option" i], .cdk-overlay-pane div[class*="item" i], .cdk-overlay-pane div[class*="card" i]',
+              'mat-option, [role="option"], [role="menuitem"], ms-model-option, .model-option, button, [role="button"], div[class*="option" i], div[class*="item" i], div[class*="card" i], div[class*="model" i], li',
             ),
           ).filter((el) => {
             if (!isVisible(el)) return false
+            const r = el.getBoundingClientRect()
+            // Model selection list is on the right side or in an overlay pane
+            if (r.left < window.innerWidth * 0.35 && !el.closest('.cdk-overlay-pane')) return false
+            if (r.height < 24 || r.height > 180 || r.width < 120 || r.width > 600) return false
             const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
-            return t.length > 0 && t.length < 300 && (/gemini/i.test(t) || /3\.8/i.test(t) || /2\.5/i.test(t))
+            if (/^start\s+building\s+with\b/i.test(t)) return false
+            if (/^model\s+selection/i.test(t)) return false
+            return (
+              t.length > 0 &&
+              t.length < 320 &&
+              (/gemini/i.test(t) || /3\.8/i.test(t) || /2\.5/i.test(t))
+            )
           })
 
-          // Keep minimal option rows so we don't pick a wrapper div containing all options
+          // Keep minimal option cards so we don't pick a wrapper div containing multiple models
           const options = rawOptions.filter(
             (el) => !rawOptions.some((child) => child !== el && el.contains(child)),
           )
@@ -978,19 +1219,24 @@ class StudioBrowserController {
           const entries = options.map((el) => ({
             el: el as HTMLElement,
             text: ((el as HTMLElement).innerText || el.textContent || '').trim().replace(/\s+/g, ' '),
+            normText: norm(((el as HTMLElement).innerText || el.textContent || '').trim()),
           }))
 
-          const desiredLower = desiredModel.toLowerCase()
-          let chosen = entries.find((e) => e.text.toLowerCase().includes(desiredLower))
+          const nonTtsEntries = entries.filter((e) => !/\btts\b/i.test(e.normText))
+          const pool = nonTtsEntries.length > 0 ? nonTtsEntries : entries
+
+          const desiredNorm = norm(desiredModel)
+          let chosen = pool.find((e) => e.normText.includes(desiredNorm))
           let usedFallback = false
 
           if (!chosen) {
             usedFallback = true
             chosen =
-              entries.find((e) => /gemini\s*3\.8\s*pro/i.test(e.text)) ||
-              entries.find((e) => /3\.8\s*pro/i.test(e.text)) ||
-              entries.find((e) => /gemini\s*3\.8\s*flash/i.test(e.text)) ||
-              entries.find((e) => /3\.8/i.test(e.text)) ||
+              pool.find((e) => /gemini\s*3\.8\s*flash/i.test(e.normText)) ||
+              pool.find((e) => /3\.8\s*flash/i.test(e.normText)) ||
+              pool.find((e) => /gemini\s*3\.8\s*pro/i.test(e.normText)) ||
+              pool.find((e) => /3\.8\s*pro/i.test(e.normText)) ||
+              pool.find((e) => /3\.8/i.test(e.normText)) ||
               undefined
           }
 
@@ -1013,11 +1259,12 @@ class StudioBrowserController {
         }, targetModel)
         .catch(() => ({ foundList: false, pickedText: '', usedFallback: false, available: [] as string[] }))
 
-      let expectedSubstringAfterPick = targetLower
+      let expectedSubstringAfterPick = targetNorm
 
       if (pickResult.pickedText) {
         const pickedLoc = page.locator('[data-cmt-picked-model="true"]').first()
         if ((await pickedLoc.count()) > 0) {
+          await pickedLoc.scrollIntoViewIfNeeded().catch(() => {})
           await pickedLoc.click().catch(() => {})
         }
         if (pickResult.usedFallback) {
@@ -1026,24 +1273,33 @@ class StudioBrowserController {
             `"${targetModel}" not in list; selected "${pickResult.pickedText}"`,
             'info',
           )
-          expectedSubstringAfterPick = /3\.8\s*pro/i.test(pickResult.pickedText)
-            ? '3.8 pro'
-            : /3\.8\s*flash/i.test(pickResult.pickedText)
-              ? '3.8 flash'
+          expectedSubstringAfterPick = /3\.8\s*flash/i.test(pickResult.pickedText)
+            ? '3.8 flash'
+            : /3\.8\s*pro/i.test(pickResult.pickedText)
+              ? '3.8 pro'
               : '3.8'
         }
-        await new Promise((r) => setTimeout(r, 450))
-        // Close any leftover dropdown backdrop
-        await page.keyboard.press('Escape').catch(() => {})
-        await new Promise((r) => setTimeout(r, 200))
+        await new Promise((r) => setTimeout(r, 500))
+        await this.dismissOpenOverlayIfAny(page)
       } else {
-        await this.dumpRunSettingsPanelDiagnostics(
-          page,
-          `model option "${targetModel}" (or "3.8") not found in model list (foundList=${pickResult.foundList}, available=${pickResult.available.join(' | ') || 'none'})`,
-        )
-        await page.keyboard.press('Escape').catch(() => {})
-        // If the model list could not be opened or did not contain targetModel, only accept if the visible model card already shows a 3.8 model when targetModel wasn't available
-        if (pickResult.foundList && !pickResult.available.some((a) => a.toLowerCase().includes(targetLower)) && /3\.8/i.test(currentCardText)) {
+        if (!clickedTrigger) {
+          await this.dumpRunSettingsPanelDiagnostics(
+            page,
+            `model selector trigger not found (attempt ${modelAttempt}/2)`,
+          )
+        } else {
+          await this.dumpRunSettingsPanelDiagnostics(
+            page,
+            `model option "${targetModel}" (or "3.8") not found in model list (foundList=${pickResult.foundList}, available=${pickResult.available.join(' | ') || 'none'})`,
+          )
+        }
+        await this.dismissOpenOverlayIfAny(page)
+        if (
+          pickResult.foundList &&
+          !pickResult.available.some((a) => normalizeModelStr(a).includes(targetNorm)) &&
+          /3\.8/i.test(currentCardText) &&
+          !/\btts\b/i.test(currentCardText)
+        ) {
           this.logStep(
             'model fallback',
             `"${targetModel}" not in list; keeping visible 3.8 model "${currentCardText}"`,
@@ -1053,14 +1309,20 @@ class StudioBrowserController {
         }
       }
 
-      // READ BACK the visible model card text from the UI
+      // IMPORTANT (from video 00:46 -> 00:50): Clicking a model card in "Model selection" automatically
+      // closes the Run Settings drawer! Re-open Run Settings now so we can read back the model card and set Thinking level.
+      await this.ensureRunSettingsPanelOpen(page)
+
+      // READ BACK the visible model card text from the Run Settings UI
       const readBackModel = await this.readVisibleModelCardText(page)
-      const readLower = readBackModel.toLowerCase()
+      const readNorm = normalizeModelStr(readBackModel)
 
       const modelMatched =
-        Boolean(readBackModel) &&
-        (readLower.includes(expectedSubstringAfterPick) ||
-          (expectedSubstringAfterPick.includes('3.8') && readLower.includes('3.8') && pickResult.usedFallback))
+        Boolean(readNorm) &&
+        !/\btts\b/i.test(readNorm) &&
+        (readNorm.includes(expectedSubstringAfterPick) ||
+          (expectedSubstringAfterPick.includes('3.8 flash') && /3\.8\s*flash/i.test(readNorm)) ||
+          (expectedSubstringAfterPick.includes('3.8') && readNorm.includes('3.8') && pickResult.usedFallback))
 
       if (modelMatched) {
         verifiedModelText = readBackModel
@@ -1076,9 +1338,9 @@ class StudioBrowserController {
       }
     }
 
-    // 2. Set Temperature = 0
+    // 2. Set Temperature = 0 (only if present; Gemini 3.8 Flash does not have a Temperature slider)
     try {
-      const tempInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.temperatureInput, 2000)
+      const tempInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.temperatureInput, 600)
       if (tempInput) {
         await tempInput.click({ clickCount: 3 })
         await tempInput.fill('0')
@@ -1088,36 +1350,7 @@ class StudioBrowserController {
       /* ignore */
     }
 
-    // 3. Set Media Resolution = Low (~65 tokens/frame) using row-scoped selector so it never hits Thinking level
-    try {
-      let resSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.mediaResolutionSelect, 1200)
-      if (!resSelect) {
-        const markedRes = await this.markRowDropdownByLabel(page, '^media\\s+resolution$', 'media-resolution')
-        if (markedRes) {
-          resSelect = page.locator('[data-cmt-row-select="media-resolution"]').first()
-        }
-      }
-      if (resSelect && (await resSelect.count()) > 0) {
-        const currResText = ((await resSelect.innerText().catch(() => '')) || '').trim()
-        if (!/\blow\b/i.test(currResText)) {
-          await resSelect.click()
-          await new Promise((r) => setTimeout(r, 300))
-          const lowOpt = page
-            .locator('mat-option:has-text("Low"), [role="option"]:has-text("Low"), [role="menuitem"]:has-text("Low")')
-            .first()
-          if ((await lowOpt.count()) > 0) {
-            await lowOpt.click()
-          } else {
-            await page.keyboard.press('Escape')
-          }
-          await new Promise((r) => setTimeout(r, 250))
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-
-    // 4. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
+    // 3. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
     let verifiedThinkingText = ''
     let thinkingConfigError = ''
 
@@ -1125,11 +1358,27 @@ class StudioBrowserController {
       await this.waitIfPausedOrThrowIfStopped(scope)
       thinkingConfigError = ''
 
+      await this.ensureRunSettingsPanelOpen(page)
+
+      // If there is a Thinking mode toggle switch that is currently unchecked, enable it first
+      try {
+        const thinkSwitch = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingToggle, 500)
+        if (thinkSwitch) {
+          const checked = await thinkSwitch.getAttribute('aria-checked')
+          if (checked === 'false') {
+            await thinkSwitch.click().catch(() => {})
+            await new Promise((r) => setTimeout(r, 300))
+          }
+        }
+      } catch {
+        /* ignore */
+      }
+
       let thinkSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingLevelSelect, 1500)
       if (!thinkSelect) {
         const markedThink = await this.markRowDropdownByLabel(
           page,
-          '^thinking\\s+(level|budget)$',
+          '^thinking(\\s+level|\\s+budget)?$',
           'thinking-level',
         )
         if (markedThink) {
@@ -1159,7 +1408,7 @@ class StudioBrowserController {
           } else {
             thinkingConfigError = '"High" option not found after opening Thinking level dropdown'
             await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
-            await page.keyboard.press('Escape').catch(() => {})
+            await this.dismissOpenOverlayIfAny(page)
           }
         }
 
@@ -1180,51 +1429,73 @@ class StudioBrowserController {
       }
     }
 
-    // 5. Open Advanced Settings if collapsed -> Max Output Tokens + Safety Settings all OFF
+    // 4. Ensure Advanced Settings is expanded (in Gemini 3.8 Flash it is expanded by default; do not collapse it!)
     try {
-      const advBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.advancedSettingsToggle, 1200)
-      if (advBtn) {
-        const expanded = await advBtn.getAttribute('aria-expanded')
-        if (expanded === 'false') {
-          await advBtn.click()
-          await new Promise((r) => setTimeout(r, 300))
-        }
-      }
+      const mediaResAlreadyVisible = await page
+        .evaluate(() => /media\s+resolution|output\s+length/i.test(document.body.innerText || ''))
+        .catch(() => false)
 
-      const maxOutInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.maxOutputTokensInput, 1500)
-      if (maxOutInput) {
-        await maxOutInput.click({ clickCount: 3 })
-        await maxOutInput.fill(String(config.maxOutputTokens || 65536))
-        await maxOutInput.press('Enter')
-      }
-
-      const safetyTrigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.safetySettingsTrigger, 1500)
-      if (safetyTrigger) {
-        await safetyTrigger.click()
-        await new Promise((r) => setTimeout(r, 400))
-        // Set all safety sliders in modal to minimum (0 = Off / Block none)
-        const sliders = page.locator(STUDIO_SELECTORS.safetySliders.join(', '))
-        const sliderCount = await sliders.count()
-        for (let i = 0; i < sliderCount; i++) {
-          const sl = sliders.nth(i)
-          await sl.fill('0').catch(async () => {
-            await sl.focus()
-            await page.keyboard.press('Home')
-          })
+      if (!mediaResAlreadyVisible) {
+        const advBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.advancedSettingsToggle, 1000)
+        if (advBtn) {
+          const expanded = await advBtn.getAttribute('aria-expanded')
+          if (expanded === 'false') {
+            await advBtn.click()
+            await new Promise((r) => setTimeout(r, 300))
+          }
         }
-        const closeBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.safetyModalClose, 1500)
-        if (closeBtn) {
-          await closeBtn.click()
-        } else {
-          await page.keyboard.press('Escape')
-        }
-        await new Promise((r) => setTimeout(r, 250))
       }
     } catch {
       /* ignore */
     }
 
-    // Final read-back verification before logging success
+    // 5. Set Media Resolution = Low using row-scoped selector so it never hits Thinking level
+    try {
+      let resSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.mediaResolutionSelect, 1200)
+      if (!resSelect) {
+        const markedRes = await this.markRowDropdownByLabel(page, '^media\\s+resolution$', 'media-resolution')
+        if (markedRes) {
+          resSelect = page.locator('[data-cmt-row-select="media-resolution"]').first()
+        }
+      }
+      if (resSelect && (await resSelect.count()) > 0) {
+        const currResText = ((await resSelect.innerText().catch(() => '')) || '').trim()
+        if (!/\blow\b/i.test(currResText)) {
+          await resSelect.scrollIntoViewIfNeeded().catch(() => {})
+          await resSelect.click()
+          await new Promise((r) => setTimeout(r, 300))
+          const lowOpt = page
+            .locator('mat-option:has-text("Low"), [role="option"]:has-text("Low"), [role="menuitem"]:has-text("Low")')
+            .first()
+          if ((await lowOpt.count()) > 0) {
+            await lowOpt.click()
+          } else {
+            await this.dismissOpenOverlayIfAny(page)
+          }
+          await new Promise((r) => setTimeout(r, 250))
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // 6. Set Output length (maxOutputTokens) & Safety Settings if needed
+    try {
+      const maxOutInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.maxOutputTokensInput, 1200)
+      if (maxOutInput) {
+        const currentMaxOut = await maxOutInput.inputValue().catch(() => '')
+        const desiredMaxOut = String(config.maxOutputTokens || 65536)
+        if (currentMaxOut.trim() !== desiredMaxOut) {
+          await maxOutInput.click({ clickCount: 3 })
+          await maxOutInput.fill(desiredMaxOut)
+          await maxOutInput.press('Enter')
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+
+    // Final read-back verification before closing Run Settings panel
     const finalModelReadBack = (await this.readVisibleModelCardText(page)) || verifiedModelText
     const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
     if (!/\bhigh\b/i.test(finalThinkingReadBack)) {
@@ -1235,9 +1506,12 @@ class StudioBrowserController {
       throw new Error(`Studio thinking level config failed: expected "High", read back "${finalThinkingReadBack || 'empty'}"`)
     }
 
+    // 7. Close the Run Settings panel (video 01:42-01:48) so the prompt box and Run button are uncovered
+    await this.closeRunSettingsPanel(page)
+
     this.logStep(
       'model set',
-      `model="${finalModelReadBack}" · thinking="${finalThinkingReadBack}" · temp=0 · mediaRes=Low · safety=OFF`,
+      `model="${finalModelReadBack}" · thinking="${finalThinkingReadBack}" · mediaRes=Low`,
       'success',
     )
   }
@@ -1475,10 +1749,90 @@ class StudioBrowserController {
   }
 
   /**
+   * Tag the Start Time, End Time, FPS inputs and Save button inside the open "Video settings" dialog
+   * (shown at 02:04-02:50 in the user's video: "Start Time (e.g., 1m10s)", "End Time (e.g., 2m30s)",
+   * "FPS (frames per second)" with placeholder "Defaults to 1 FPS", and buttons "Cancel" / "Save").
+   */
+  private async tagVideoSettingsDialogControls(page: Page): Promise<void> {
+    await page
+      .evaluate(() => {
+        document
+          .querySelectorAll('[data-cmt-video-input]')
+          .forEach((el) => el.removeAttribute('data-cmt-video-input'))
+        document
+          .querySelectorAll('[data-cmt-video-save]')
+          .forEach((el) => el.removeAttribute('data-cmt-video-save'))
+
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        const dialogs = Array.from(
+          document.querySelectorAll(
+            'mat-dialog-container, [role="dialog"], .cdk-overlay-pane, [class*="video-settings" i], [class*="video-options" i]',
+          ),
+        ).filter((el) => isVisible(el) && el.querySelectorAll('input').length >= 2)
+
+        const root = dialogs[dialogs.length - 1] || document.body
+        const visibleInputs = Array.from(root.querySelectorAll('input')).filter(
+          (inp) => isVisible(inp) && inp.type !== 'file' && inp.type !== 'checkbox' && inp.type !== 'hidden',
+        )
+
+        let taggedStart = false
+        let taggedEnd = false
+        let taggedFps = false
+
+        for (const inp of visibleInputs) {
+          const contextText = (
+            (inp.getAttribute('aria-label') || '') +
+            ' ' +
+            (inp.getAttribute('placeholder') || '') +
+            ' ' +
+            (inp.closest('mat-form-field, label, .form-field, div')?.textContent || '')
+          )
+            .toLowerCase()
+            .replace(/\s+/g, ' ')
+
+          if (!taggedStart && /start\s*time|1m10s/i.test(contextText)) {
+            inp.setAttribute('data-cmt-video-input', 'start')
+            taggedStart = true
+          } else if (!taggedEnd && /end\s*time|2m30s/i.test(contextText)) {
+            inp.setAttribute('data-cmt-video-input', 'end')
+            taggedEnd = true
+          } else if (!taggedFps && /\bfps\b|frames\s+per\s+second|defaults\s+to\s+1\s+fps/i.test(contextText)) {
+            inp.setAttribute('data-cmt-video-input', 'fps')
+            taggedFps = true
+          }
+        }
+
+        // Positional fallback if inside a dialog with exactly 3 visible inputs (Start Time, End Time, FPS)
+        if (dialogs.length > 0 && visibleInputs.length === 3) {
+          if (!taggedStart) visibleInputs[0].setAttribute('data-cmt-video-input', 'start')
+          if (!taggedEnd) visibleInputs[1].setAttribute('data-cmt-video-input', 'end')
+          if (!taggedFps) visibleInputs[2].setAttribute('data-cmt-video-input', 'fps')
+        }
+
+        // Tag the Save button (never Cancel or Close)
+        const btns = Array.from(root.querySelectorAll('button, [role="button"]')).filter(isVisible)
+        for (const b of btns) {
+          const txt = (b.innerText || b.textContent || '').trim()
+          if (/^save$/i.test(txt) || /^apply$/i.test(txt) || /^done$/i.test(txt)) {
+            b.setAttribute('data-cmt-video-save', 'true')
+            break
+          }
+        }
+      })
+      .catch(() => {})
+  }
+
+  /**
    * FIX 1: Attach a YouTube link or Drive file or local file as a video asset in the prompt,
-   * verify media chip count increased, verify the added chip matches the intended video,
-   * configure Start Time, End Time, and FPS = 24 via the Video Settings dialog,
-   * and READ BACK all three values to confirm they stuck (retrying the dialog once, then THROWING).
+   * verify media chip count increased AND finished "Loading..." (gear icon visible),
+   * configure Start Time (e.g. 0s), End Time (e.g. 5m), and FPS = 24 via the Video Settings dialog,
+   * READ BACK all three values to confirm they stuck, and click Save.
    */
   private async attachVideoAndConfigureRange(
     page: Page,
@@ -1495,6 +1849,9 @@ class StudioBrowserController {
   ) {
     const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
     await this.waitIfPausedOrThrowIfStopped(scope)
+
+    // Ensure Run Settings panel is closed before interacting with the prompt box / + button / chips
+    await this.closeRunSettingsPanel(page)
 
     const uploadedBasename =
       driveFileName ||
@@ -1610,14 +1967,25 @@ class StudioBrowserController {
       throw new Error(`No media source available to attach ${label} video in Studio`)
     }
 
-    // FIX 1a: Wait for the new video chip to appear via combined locator, and dump diagnostics BEFORE throwing if chip count did not increase
+    // FIX 1a: Wait for the new video chip to appear AND finish "Loading..." (so its gear button "Edit video options" is present)
     const waitDeadline = Date.now() + 90_000
     let chipCount = chipsBefore
     while (Date.now() < waitDeadline) {
       await this.waitIfPausedOrThrowIfStopped(scope)
       await this.syncFallbackMediaChips(page)
       chipCount = await chipsLocator.count()
-      if (chipCount > chipsBefore) break
+      if (chipCount > chipsBefore) {
+        const candidateChip = chipsLocator.nth(chipsBefore)
+        const chipText = ((await candidateChip.innerText().catch(() => '')) || '').trim()
+        const gearBtnCount = await candidateChip
+          .locator('button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i]')
+          .count()
+          .catch(() => 0)
+        // As shown in video 01:54 -> 01:56, while "Loading..." is displayed the gear icon is not ready yet
+        if (gearBtnCount > 0 || !/\bloading\b/i.test(chipText)) {
+          break
+        }
+      }
       await new Promise((r) => setTimeout(r, 500))
     }
 
@@ -1642,7 +2010,7 @@ class StudioBrowserController {
     }
 
     // FIX 1c: Open Video Settings on targetChip via button[aria-label="Edit video options"],
-    // set start / end / FPS, and READ BACK all three values.
+    // set Start Time (e.g. 0s), End Time (e.g. 5m), and FPS = 24, and READ BACK all three values.
     // Retry the dialog once if any input is missing or any value did not stick, then THROW.
     const startStr = this.formatClockForStudioInput(startSec)
     const endStr = this.formatClockForStudioInput(endSec)
@@ -1690,7 +2058,10 @@ class StudioBrowserController {
           }
         }
       }
-      await new Promise((r) => setTimeout(r, 600))
+      await new Promise((r) => setTimeout(r, 650))
+
+      // Tag the Start Time, End Time, FPS inputs and Save button inside the open Video settings dialog
+      await this.tagVideoSettingsDialogControls(page)
 
       const startInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoStartTimeInput, 2500)
       const endInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoEndTimeInput, 2500)
@@ -1708,19 +2079,22 @@ class StudioBrowserController {
       } else {
         await startInput.click({ clickCount: 3 })
         await startInput.fill(startStr)
+        await startInput.dispatchEvent('input').catch(() => {})
         await startInput.dispatchEvent('change').catch(() => {})
 
         await endInput.click({ clickCount: 3 })
         await endInput.fill(endStr)
+        await endInput.dispatchEvent('input').catch(() => {})
         await endInput.dispatchEvent('change').catch(() => {})
 
         await fpsInput.click({ clickCount: 3 })
         await fpsInput.fill(String(fps))
+        await fpsInput.dispatchEvent('input').catch(() => {})
         await fpsInput.dispatchEvent('change').catch(() => {})
         await fpsInput.press('Tab').catch(() => {})
         await new Promise((r) => setTimeout(r, 250))
 
-        // Read back the three values from the dialog before closing
+        // Read back the three values from the dialog before clicking Save
         const readStartRaw = await startInput.inputValue().catch(() => '')
         const readEndRaw = await endInput.inputValue().catch(() => '')
         const readFpsRaw = await fpsInput.inputValue().catch(() => '')
@@ -1741,14 +2115,15 @@ class StudioBrowserController {
         }
       }
 
-      // Close/save the dialog
+      // Click the "Save" button at the bottom-right of the Video settings dialog (video 02:49)
+      await this.tagVideoSettingsDialogControls(page)
       const saveBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoSettingsSaveButton, 1500)
       if (saveBtn) {
         await saveBtn.click().catch(() => {})
       } else {
-        await page.keyboard.press('Escape').catch(() => {})
+        await page.keyboard.press('Enter').catch(() => {})
       }
-      await new Promise((r) => setTimeout(r, 500))
+      await new Promise((r) => setTimeout(r, 600))
 
       if (!lastConfigError) {
         break
@@ -1795,25 +2170,80 @@ class StudioBrowserController {
   }
 
   /**
-   * Read AI Studio's token counter from the DOM (e.g. "742,110 / 1,048,576 tokens").
+   * Read AI Studio's total token counter from the DOM.
+   * As shown in the user's video (02:56-03:04), the total token count is displayed in the top header bar
+   * next to "Untitled prompt" (e.g. "520,801 tokens") AND each media chip also displays its own token count.
+   * We inspect both the top header and all chip token counts so we never return only a single small chip's
+   * token count when two videos are attached.
    */
   public async readStudioTokenCount(page: Page): Promise<number | null> {
     try {
       const count = await page.evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        // 1. Check top header bar elements (rect.top < 115) for total prompt tokens (next to "Untitled prompt")
+        let headerTokens = 0
+        const topNodes = Array.from(document.body.querySelectorAll('span, div, button, p'))
+        for (const node of topNodes) {
+          if (!isVisible(node)) continue
+          const r = node.getBoundingClientRect()
+          if (r.top < 0 || r.top > 115 || r.height > 60) continue
+          const txt = ((node as HTMLElement).innerText || node.textContent || '').trim()
+          if (txt.length > 80) continue
+          const m = txt.match(/([\d,]+)\s*(?:\/\s*[\d,]+\s*)?tokens?\b/i)
+          if (m) {
+            const val = parseInt(m[1].replace(/,/g, ''), 10)
+            if (Number.isFinite(val) && val > headerTokens) {
+              headerTokens = val
+            }
+          }
+        }
+
+        // 2. Sum token counts across all attached media chips (each chip has one Edit video options button)
+        let chipTokensSum = 0
+        const editBtns = Array.from(
+          document.body.querySelectorAll(
+            'button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i], button[aria-label*="Video options" i]',
+          ),
+        )
+        const visitedChips = new Set<Element>()
+        for (const btn of editBtns) {
+          let curr: Element | null = btn.parentElement
+          for (let d = 0; d < 6 && curr && curr !== document.body; d++) {
+            const txt = ((curr as HTMLElement).innerText || curr.textContent || '').trim()
+            const m = txt.match(/([\d,]+)\s*tokens?\b/i)
+            if (m && curr.querySelectorAll('button[aria-label*="Edit video" i]').length === 1) {
+              if (!visitedChips.has(curr)) {
+                visitedChips.add(curr)
+                const val = parseInt(m[1].replace(/,/g, ''), 10)
+                if (Number.isFinite(val) && val > 0) {
+                  chipTokensSum += val
+                }
+              }
+              break
+            }
+            curr = curr.parentElement
+          }
+        }
+
+        // 3. Also scan all token occurrences in bodyText and take the maximum
         const bodyText = document.body.innerText || ''
-        // Pattern 1: "742,110 / 1,048,576 tokens" or "742,110 / 1,000,000"
-        const m1 = bodyText.match(/([\d,]{3,})\s*\/\s*[\d,]+\s*tokens?/i)
-        if (m1) {
-          const n = parseInt(m1[1].replace(/,/g, ''), 10)
-          if (Number.isFinite(n)) return n
+        let maxBodyTokens = 0
+        const allMatches = bodyText.matchAll(/([\d,]{3,})\s*(?:\/\s*[\d,]+\s*)?tokens?\b/gi)
+        for (const m of allMatches) {
+          const val = parseInt(m[1].replace(/,/g, ''), 10)
+          if (Number.isFinite(val) && val > maxBodyTokens) {
+            maxBodyTokens = val
+          }
         }
-        // Pattern 2: "742,110 tokens"
-        const m2 = bodyText.match(/([\d,]{3,})\s*tokens?/i)
-        if (m2) {
-          const n = parseInt(m2[1].replace(/,/g, ''), 10)
-          if (Number.isFinite(n)) return n
-        }
-        return null
+
+        const best = Math.max(headerTokens, chipTokensSum, maxBodyTokens)
+        return best > 0 ? best : null
       })
       if (count !== null) {
         this.tokenCount = count

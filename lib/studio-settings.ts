@@ -97,7 +97,7 @@ export function computeEffectiveMaxInputTokens(
 
 const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   chunkScanEngine: 'api',
-  studioModelName: 'Gemini 3.8 Pro',
+  studioModelName: 'Gemini 3.8 Flash',
   studioMaxOutputTokens: 65536,
   studioMaxInputTokens: null,
   studioPageRecycleInterval: 5,
@@ -160,7 +160,7 @@ export async function loadStudioUserConfig(username: string): Promise<StudioUser
 
   const rawModel = (raw?.studioModelName || '').trim()
   const resolvedModelName =
-    !rawModel || rawModel === 'Gemini 2.5 Pro'
+    !rawModel || rawModel === 'Gemini 2.5 Pro' || rawModel === 'Gemini 3.8 Pro'
       ? DEFAULT_STUDIO_CONFIG.studioModelName
       : rawModel
 
