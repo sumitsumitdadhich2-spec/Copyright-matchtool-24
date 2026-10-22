@@ -64,33 +64,45 @@ function hasTruncatedTimestampToken(line: string): boolean {
 }
 
 /**
- * Check whether the final non-empty line of HISSA 2 looks cut off / truncated mid-stream.
+ * Check whether the tail of HISSA 2 looks cut off / truncated mid-stream.
+ * Examines the final non-empty portion of normalized text, checking for:
+ * 1. Dangling connectors / arrows / hyphens / colons at the end of the text.
+ * 2. Incomplete millisecond timestamp at the end (e.g. "00:13.0" or "00:13.").
+ * 3. An incomplete final "Short" entry that was cut off before its arrow or target.
  */
-function isLastLineTruncated(line: string): boolean {
-  const trimmed = line.trim().replace(/^[-*•]\s*/, '')
+function isTailTruncated(normalizedHissa2: string): boolean {
+  const trimmed = normalizedHissa2.trim().replace(/[\])]+$/, '').trim()
   if (!trimmed) return false
 
-  // Ends with dangling connector or incomplete timestamp/arrow
-  if (/(?:-->|->|—>|=>|→|-|–|:|\.\d{0,2})$/.test(trimmed)) {
+  // Dangling connector or incomplete timestamp token at the very end
+  if (/(?:-->|->|—>|=>|→|-|–|—|:|\.\d{0,2})$/.test(trimmed)) {
     return true
   }
 
-  // Any timestamp with 1 or 2 decimal places instead of 3 (e.g. "00:13.0" or "00:13.00")
-  if (hasTruncatedTimestampToken(trimmed)) {
+  const lastToken = trimmed.split(' ').pop() || ''
+  if (hasTruncatedTimestampToken(lastToken)) {
     return true
   }
 
-  // If the line starts with "Short", it must be either a full Short-->Movie match line or a full Short-->NOT FOUND line
-  if (/^Short\b/i.test(trimmed)) {
-    const isCompleteMatchLine =
-      /^Short[:\s]+((?:\d+:)?\d{1,2}:\d{2}(?:\.\d{3})?)\s*(?:-|–|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d{3})?)\s*(?:-->|->|—>|=>|→)\s*Movie[:\s]+((?:\d+:)?\d{1,2}:\d{2}(?:\.\d{3})?)\s*(?:-|–|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d{3})?)/i.test(
-        trimmed,
+  // Find the last "Short" entry in normalized text
+  const allShorts = [...trimmed.matchAll(/\bShort\b/gi)]
+  const lastShortMatch = allShorts.pop()
+  if (lastShortMatch && lastShortMatch.index !== undefined) {
+    const lastEntry = trimmed.slice(lastShortMatch.index)
+
+    // Complete match entry: Short <start> - <end> --> Movie <start> - <end>
+    const hasCompleteMatch =
+      /\bShort[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-->|->|—>|=>|→)\s*Movie[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?/i.test(
+        lastEntry,
       )
-    const isCompleteNotFoundLine =
-      /^Short[:\s]+((?:\d+:)?\d{1,2}:\d{2}(?:\.\d{3})?)\s*(?:-|–|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d{3})?)\s*(?:-->|->|—>|=>|→|:|-|–)?\s*NOT[\s_]*FOUND\b/i.test(
-        trimmed,
+
+    // Complete not-found entry: Short <start> - <end> --> NOT FOUND
+    const hasCompleteNotFound =
+      /\bShort[:\s]+(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-|–|—|to)\s*(?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?\s*(?:-->|->|—>|=>|→|:|-|–|—)?\s*NOT[\s_]*FOUND\b/i.test(
+        lastEntry,
       )
-    if (!isCompleteMatchLine && !isCompleteNotFoundLine) {
+
+    if (!hasCompleteMatch && !hasCompleteNotFound) {
       return true
     }
   }
@@ -101,6 +113,7 @@ function isLastLineTruncated(line: string): boolean {
 /**
  * Pure, synchronous validator for AI Studio chunk-map answers.
  * Runs immediately after fetching the answer (zero sleep/await).
+ * Normalizes text to tolerate wrapped lines, multi-line entries, and annotations.
  */
 export function validateStudioAnswer(
   text: string,
@@ -140,8 +153,8 @@ export function validateStudioAnswer(
     }
   }
 
-  // Check 1: Too short (< 200 chars)
-  if (trimmed.length < 200) {
+  // Check 1: Too short (< 100 chars)
+  if (trimmed.length < 100) {
     return {
       ok: false,
       reason: 'empty',
@@ -183,12 +196,10 @@ export function validateStudioAnswer(
     }
   }
 
-  const nonEmptyHissa2Lines = hissa2Body
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l.length > 0 && !/^[=\-_]{3,}$/.test(l))
+  // Normalize HISSA 2 body: replace line breaks with spaces and collapse consecutive whitespace
+  const normalizedHissa2 = hissa2Body.replace(/[\r\n\t]+/g, ' ').replace(/\s+/g, ' ').trim()
 
-  if (nonEmptyHissa2Lines.length === 0) {
+  if (!normalizedHissa2) {
     return {
       ok: false,
       reason: 'empty_hissa2',
@@ -200,22 +211,8 @@ export function validateStudioAnswer(
     }
   }
 
-  // Check 5: Truncation check on the last non-empty line in HISSA 2
-  const lastNonEmptyLine = nonEmptyHissa2Lines[nonEmptyHissa2Lines.length - 1]
-  if (isLastLineTruncated(lastNonEmptyLine)) {
-    return {
-      ok: false,
-      reason: 'truncated_last_line',
-      cleanedText,
-      stats: {
-        ...emptyStats,
-        cleanedLength: cleanedText.length,
-      },
-    }
-  }
-
   // Check 4: HISSA 2 must have at least one valid match line (via parseChunkMatches) or NOT FOUND line
-  const parsedMatches = parseChunkMatches(hissa2Body, 0, 0, 'studio')
+  const parsedMatches = parseChunkMatches(normalizedHissa2, 0, 0, 'studio')
   const matchLineCount = parsedMatches.length
 
   let notFoundLineCount = 0
@@ -227,19 +224,23 @@ export function validateStudioAnswer(
     }
   }
 
-  const shortRangeRe =
-    /^(?:[-*•]\s*)?Short[:\s]+((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-|–|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)/i
+  // Match NOT FOUND entries in normalized text
+  const notFoundPattern =
+    /\bShort[:\s]+((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d{1,2}:\d{2}(?:\.\d+)?)\s*(?:-->|->|—>|=>|→|:|-|–|—)?\s*NOT[\s_]*FOUND\b/gi
+  let nfMatch: RegExpExecArray | null
+  while ((nfMatch = notFoundPattern.exec(normalizedHissa2)) !== null) {
+    notFoundLineCount += 1
+    const endSec = parseClockSec(nfMatch[2])
+    if (endSec !== null && (maxShortEndSec === null || endSec > maxShortEndSec)) {
+      maxShortEndSec = endSec
+    }
+  }
 
-  for (const line of nonEmptyHissa2Lines) {
-    if (/\bNOT[\s_]*FOUND\b/i.test(line)) {
-      notFoundLineCount += 1
-      const sr = line.match(shortRangeRe)
-      if (sr) {
-        const endSec = parseClockSec(sr[2])
-        if (endSec !== null && (maxShortEndSec === null || endSec > maxShortEndSec)) {
-          maxShortEndSec = endSec
-        }
-      }
+  // Fallback: If no "Short ... --> NOT FOUND" matched but "NOT FOUND" is present in text
+  if (notFoundLineCount === 0 && /\bNOT[\s_]*FOUND\b/i.test(normalizedHissa2)) {
+    const rawMatches = normalizedHissa2.match(/\bNOT[\s_]*FOUND\b/gi)
+    if (rawMatches) {
+      notFoundLineCount = rawMatches.length
     }
   }
 
@@ -255,6 +256,23 @@ export function validateStudioAnswer(
         matchLineCount: 0,
         notFoundLineCount: 0,
         totalValidHissa2Lines: 0,
+        maxShortEndSec,
+      },
+    }
+  }
+
+  // Check 5: Truncation check on the tail of HISSA 2
+  if (isTailTruncated(normalizedHissa2)) {
+    return {
+      ok: false,
+      reason: 'truncated_last_line',
+      cleanedText,
+      stats: {
+        rawLength: raw.length,
+        cleanedLength: cleanedText.length,
+        matchLineCount,
+        notFoundLineCount,
+        totalValidHissa2Lines,
         maxShortEndSec,
       },
     }

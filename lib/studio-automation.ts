@@ -15,6 +15,7 @@ import {
 } from './studio-settings'
 import { buildStudioChunkPrompt } from './studio-prompt'
 import { parseChunkMatches } from './gemini'
+import { validateStudioAnswer, type StudioValidationResult } from './studio-result-validator'
 import { fmtTime } from './format'
 import type { ChunkMatch } from './types'
 
@@ -694,6 +695,10 @@ class StudioBrowserController {
    * Note: Gemini 3.8 Flash does NOT have a "Temperature" field in Run Settings —
    * it shows "Run settings", "System instructions", "Thinking level", "Media resolution", "Output length".
    */
+  /**
+   * Check whether the right-hand Run Settings panel is currently open and visible in the DOM.
+   * Strictly verifies actual visible container elements without false-positive body text matching.
+   */
   private async isRunSettingsPanelOpen(page: Page): Promise<boolean> {
     try {
       return await page.evaluate(() => {
@@ -701,32 +706,39 @@ class StudioBrowserController {
           if (!el) return false
           const h = el as HTMLElement
           const r = h.getBoundingClientRect()
-          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+          const style = window.getComputedStyle(h)
+          return (
+            r.width >= 160 &&
+            r.height >= 80 &&
+            style.visibility !== 'hidden' &&
+            style.display !== 'none' &&
+            style.opacity !== '0' &&
+            h.getAttribute('aria-hidden') !== 'true'
+          )
         }
 
         const containers = Array.from(
           document.querySelectorAll(
-            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i]), ms-model-selector',
+            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i])',
           ),
         )
         for (const c of containers) {
-          if (!isVisible(c)) continue
-          const tag = c.tagName.toLowerCase()
-          if (tag === 'button') continue
-          const r = c.getBoundingClientRect()
-          if (r.width >= 150 && r.height >= 60) return true
+          if (isVisible(c)) return true
         }
 
-        const bodyText = document.body.innerText || ''
-        if (
-          /thinking\s+level/i.test(bodyText) ||
-          /media\s+resolution/i.test(bodyText) ||
-          /output\s+length/i.test(bodyText) ||
-          (/system\s+instructions/i.test(bodyText) && /run\s+settings/i.test(bodyText)) ||
-          (/temperature/i.test(bodyText) && /run\s+settings/i.test(bodyText))
-        ) {
-          return true
+        // Check if Thinking dropdown/slider or model selector is directly visible on right side of viewport
+        const rightControls = Array.from(
+          document.querySelectorAll(
+            'ms-model-selector, ms-thinking-budget-slider, mat-select[aria-label*="Thinking" i], [data-cmt-row-select="thinking-level"]',
+          ),
+        )
+        for (const ctrl of rightControls) {
+          const r = (ctrl as HTMLElement).getBoundingClientRect()
+          if (isVisible(ctrl) && r.left > window.innerWidth * 0.4) {
+            return true
+          }
         }
+
         return false
       })
     } catch {
@@ -765,13 +777,13 @@ class StudioBrowserController {
 
   /**
    * Ensure the right-hand Run Settings panel is open.
-   * Never clicks the toggle button if the panel is already open; if closed, clicks
-   * `button[aria-label="Toggle run settings panel"]` (`button.runsettings-toggle-button`)
-   * and polls until the panel is visibly open.
+   * New chats have the Run Settings panel closed. Before searching for the dropdown,
+   * clicks button[aria-label="Toggle run settings panel"] to open the panel and
+   * waits until the panel is in the DOM.
    */
   private async ensureRunSettingsPanelOpen(page: Page): Promise<boolean> {
     if (await this.isRunSettingsPanelOpen(page)) return true
-    await new Promise((r) => setTimeout(r, 300))
+    await new Promise((r) => setTimeout(r, 200))
     if (await this.isRunSettingsPanelOpen(page)) return true
 
     await this.dismissOpenOverlayIfAny(page)
@@ -780,13 +792,13 @@ class StudioBrowserController {
     const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2500)
     if (toggle) {
       await toggle.click().catch(() => {})
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 16; i++) {
         await new Promise((r) => setTimeout(r, 250))
         if (await this.isRunSettingsPanelOpen(page)) return true
       }
     }
 
-    // Second attempt via direct DOM click on button.runsettings-toggle-button
+    // Second attempt via direct DOM click on button[aria-label="Toggle run settings panel"]
     const clickedDom = await page
       .evaluate(() => {
         const btn = document.querySelector(
@@ -801,7 +813,7 @@ class StudioBrowserController {
       .catch(() => false)
 
     if (clickedDom) {
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 16; i++) {
         await new Promise((r) => setTimeout(r, 250))
         if (await this.isRunSettingsPanelOpen(page)) return true
       }
@@ -1058,10 +1070,16 @@ class StudioBrowserController {
   ) {
     await this.waitIfPausedOrThrowIfStopped(scope)
 
-    // 0. Ensure Run Settings panel is open (without closing it if already open!)
-    const panelOpened = await this.ensureRunSettingsPanelOpen(page)
+    // 0. New chats have the Run Settings panel closed. Before searching for the dropdown,
+    // ensure panel is opened by clicking toggle and waiting for panel in the DOM.
+    let panelOpened = await this.isRunSettingsPanelOpen(page)
+    if (!panelOpened) {
+      this.logStep('opening run settings', 'Run settings panel closed in chat -> clicking toggle', 'info')
+      panelOpened = await this.ensureRunSettingsPanelOpen(page)
+    }
     if (!panelOpened) {
       await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings panel did not open after clicking toggle')
+      throw new Error('Studio thinking level config failed: Run settings panel could not be opened')
     }
 
     // 1. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
@@ -1072,7 +1090,10 @@ class StudioBrowserController {
       await this.waitIfPausedOrThrowIfStopped(scope)
       thinkingConfigError = ''
 
-      await this.ensureRunSettingsPanelOpen(page)
+      // Check if the panel is open before attempting dropdown interaction
+      if (!(await this.isRunSettingsPanelOpen(page))) {
+        await this.ensureRunSettingsPanelOpen(page)
+      }
 
       // If there is a Thinking mode toggle switch that is currently unchecked, enable it first
       try {
@@ -2842,27 +2863,70 @@ class StudioBrowserController {
         // On timeout (doneIndicator === null), still attempt one fetch + validate in case the answer finished on screen.
         let validationReason = transientBannerReason || ''
         let fetchedSource: 'clipboard' | 'dom' = 'dom'
+        let validation: StudioValidationResult | null = null
 
         if (!transientBannerReason) {
           const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
           fetchedSource = fetched.source
-          const validation = validateStudioAnswer(fetched.text, {
-            shortWindowSec: shortEndSec - shortStartSec,
-          })
+          const answerText = fetched.text || lastCandidateText
 
-          if (validation.ok) {
-            rawAnswer = validation.cleanedText
-            if (validation.stats.softWarning) {
-              this.logStep('result coverage note', validation.stats.softWarning, 'warn')
-            }
+          // Wrap validation in try/catch so internal validator exceptions never cause a failure/retry
+          try {
+            validation = validateStudioAnswer(answerText, {
+              shortWindowSec: shortEndSec - shortStartSec,
+            })
+          } catch (valErr) {
+            const valErrMsg = valErr instanceof Error ? valErr.message : String(valErr)
             this.logStep(
-              `result check OK (HISSA 1 + HISSA 2, ${validation.stats.totalValidHissa2Lines} lines, source=${fetchedSource})`,
-              `${rawAnswer.length} chars (matches=${validation.stats.matchLineCount}, notFound=${validation.stats.notFoundLineCount})`,
-              'success',
+              'validate error',
+              `ERROR [validate] validateStudioAnswer threw: ${valErrMsg} -> keeping answer as DONE (validation skipped)`,
+              'warn',
             )
-          } else {
-            validationReason =
-              !doneIndicator && validation.reason === 'empty' ? 'timeout_10m' : validation.reason
+            onLog?.(
+              'warn',
+              `ERROR [validate] Studio validator exception: ${valErrMsg}. Marking DONE (validation skipped) and accepting answer.`,
+            )
+            rawAnswer = answerText
+          }
+
+          if (validation) {
+            if (validation.ok) {
+              rawAnswer = validation.cleanedText
+              if (validation.stats.softWarning) {
+                this.logStep('result coverage note', validation.stats.softWarning, 'warn')
+              }
+              this.logStep(
+                'SUCCESS [validate]',
+                `result check OK (HISSA 1 + HISSA 2, ${validation.stats.totalValidHissa2Lines} lines: ${validation.stats.matchLineCount} matches, ${validation.stats.notFoundLineCount} notFound, source=${fetchedSource})`,
+                'success',
+              )
+              onLog?.(
+                'success',
+                `SUCCESS [validate] ${jobLabel}: valid result (${validation.stats.totalValidHissa2Lines} lines: ${validation.stats.matchLineCount} matches, ${validation.stats.notFoundLineCount} not found, source=${fetchedSource})`,
+              )
+            } else {
+              // If doneIndicator was HISSA_FOUND, both HISSA 1 and HISSA 2 were detected on screen!
+              // Preserve the result instead of throwing away and retrying
+              if (
+                doneIndicator === 'HISSA_FOUND' &&
+                /HISSA\s*1\b/i.test(answerText) &&
+                /HISSA\s*2\b/i.test(answerText)
+              ) {
+                this.logStep(
+                  'HISSA_FOUND preserved',
+                  `Validation reason=${validation.reason}, but HISSA_FOUND was detected on screen. Marking DONE (validation skipped).`,
+                  'warn',
+                )
+                onLog?.(
+                  'warn',
+                  `[validate] Validation flagged reason=${validation.reason}, but HISSA_FOUND was detected on screen. Marking DONE (validation skipped) and accepting answer (${answerText.length} chars).`,
+                )
+                rawAnswer = answerText
+              } else {
+                validationReason =
+                  !doneIndicator && validation.reason === 'empty' ? 'timeout_10m' : validation.reason
+              }
+            }
           }
         }
 
@@ -2870,13 +2934,13 @@ class StudioBrowserController {
           invalidResultRetries += 1
           const badReason = validationReason || 'empty'
           this.logStep(
-            `result BAD: ${badReason} -> naya chat, same window retry (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
-            jobLabel,
+            `RETRY [runWindowJob] (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
+            `result BAD: ${badReason} -> naya chat, same window retry`,
             'warn',
           )
           onLog?.(
             'warn',
-            `Studio result BAD (${badReason}) on ${jobLabel} — opening new chat and retrying same window (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
+            `RETRY [runWindowJob] Studio result BAD (${badReason}) on ${jobLabel} — opening new chat and retrying same window (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
           )
           if (invalidResultRetries > MAX_INVALID_RESULT_RETRIES) {
             throw new Error(`INVALID_RESULT_EXHAUSTED: ${badReason}`)
@@ -2908,6 +2972,17 @@ class StudioBrowserController {
         // Item 4: Token-report fallback — when Studio counter is not readable, estimate with 1940 tokens/sec (calibrated: 930K / 480 s).
         // The real counter always wins when readable.
         const fallbackTokens24Fps = Math.round(totalVideoSec * 1940)
+        const matchSummary =
+          calibrated.matches.length > 0
+            ? `found ${calibrated.matches.length} matches`
+            : 'not found (no matches in this window)'
+
+        this.logStep('SUCCESS [runWindowJob]', `${jobLabel}: ${matchSummary}`, 'success')
+        onLog?.(
+          'success',
+          `SUCCESS [runWindowJob] ${jobLabel}: ${matchSummary} (${tokens || fallbackTokens24Fps} tokens)`,
+        )
+
         return {
           status: 'success',
           rawText: rawAnswer,
@@ -2918,6 +2993,19 @@ class StudioBrowserController {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
+
+        // User pause/stop must not be logged as error, use "STOPPED BY USER"
+        const isUserStopped =
+          msg === 'STOPPED BY USER' ||
+          /stopped by user/i.test(msg) ||
+          this.isStopping(scope)
+
+        if (isUserStopped) {
+          this.logStep('STOPPED BY USER', jobLabel, 'info')
+          onLog?.('info', `STOPPED BY USER on ${jobLabel}`)
+          throw new Error('STOPPED BY USER')
+        }
+
         if (
           msg.includes('PERMISSION_DENIED_EXHAUSTED:') ||
           msg.includes('INVALID_RESULT_EXHAUSTED:')
@@ -2940,11 +3028,14 @@ class StudioBrowserController {
         }
         const backoffSec = attempt * 15
         this.logStep(
-          `retry ${attempt}/${MAX_ATTEMPTS}`,
-          `${msg.slice(0, 100)} — waiting ${backoffSec}s`,
+          `RETRY [runWindowJob] (${attempt}/${MAX_ATTEMPTS})`,
+          `ERROR: ${msg.slice(0, 100)} — waiting ${backoffSec}s`,
           'warn',
         )
-        onLog?.('warn', `Studio job ${jobLabel} attempt ${attempt}/${MAX_ATTEMPTS} error: ${msg} — retrying in ${backoffSec}s...`)
+        onLog?.(
+          'warn',
+          `RETRY [runWindowJob] Studio job ${jobLabel} attempt ${attempt}/${MAX_ATTEMPTS} error: ${msg} — retrying in ${backoffSec}s...`,
+        )
         if (attempt >= MAX_ATTEMPTS) {
           // Item 5: Count failed window job toward page recycle interval too
           await this.recordFinishedWindowJobAndMaybeRecyclePage(

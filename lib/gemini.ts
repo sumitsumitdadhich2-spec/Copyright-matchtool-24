@@ -2140,8 +2140,11 @@ export function parseChunkMatches(raw: string, chunkIndex: number, chunkOffsetSe
   // Matches flexible formats:
   // "- Short 00:18.042 - 00:19.125 --> Movie 00:00.000 - 00:01.083"
   // "Short: 00:18.042 to 00:19.125 -> Movie: 00:00.000 to 00:01.083"
-  // including HH:MM:SS or MM:SS format and various arrow types (--> / -> / => / →)
-  const re = /(?:^|\n)\s*(?:[-*•]\s*)?Short[:\s]+((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-|–|to)\s*((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-->|->|—>|=>|→)\s*Movie[:\s]+((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-|–|to)\s*((?:\d+:)?\d+:\d+(?:\.\d+)?)/gi
+  // "Short 00:15.000 - 00:16.000 --> Movie 01:07.250 - 01:08.250 (1614-1638 frames)"
+  // including HH:MM:SS or MM:SS format, various dash/arrow types (--> / -> / —> / => / →),
+  // and entries wrapped on the same line or separated by spaces/annotations.
+  const re =
+    /\bShort[:\s]+((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-->|->|—>|=>|→)\s*Movie[:\s]+((?:\d+:)?\d+:\d+(?:\.\d+)?)\s*(?:-|–|—|to)\s*((?:\d+:)?\d+:\d+(?:\.\d+)?)/gi
   let m: RegExpExecArray | null
   while ((m = re.exec(raw)) !== null) {
     const shortStart = parseTsFlexible(m[1]) ?? parseTs(m[1])

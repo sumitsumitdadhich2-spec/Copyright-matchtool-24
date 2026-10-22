@@ -365,7 +365,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
             <div className="flex items-center justify-between gap-2 flex-wrap">
               <div className="flex items-center gap-1.5">
                 <CloudUpload className="size-4 text-sky-400" />
-                <span className="text-xs font-semibold">Google Drive ("CMT" folder auto-upload)</span>
+                <span className="text-xs font-semibold">Google Drive (&ldquo;CMT&rdquo; folder auto-upload)</span>
               </div>
               {studio?.driveConnected ? (
                 <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 font-mono text-[11px] text-emerald-400">
@@ -381,7 +381,7 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
 
             <p className="text-[11px] text-muted-foreground leading-relaxed">
               Uploads <code className="text-foreground">movie_360p.mp4</code> once to your Drive folder{' '}
-              <code className="text-foreground">"CMT"</code> via resumable upload (scope:{' '}
+              <code className="text-foreground">&ldquo;CMT&rdquo;</code> via resumable upload (scope:{' '}
               <code className="text-foreground">drive.file</code>, refresh token stored encrypted).
             </p>
 

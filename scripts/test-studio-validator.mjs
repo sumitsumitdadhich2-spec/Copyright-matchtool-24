@@ -79,4 +79,28 @@ const resTruncated = validateStudioAnswer(truncatedSample)
 assert.equal(resTruncated.ok, false)
 assert.equal(resTruncated.reason, 'truncated_last_line')
 
+// 7. Sahi Result Sample (wrapped text, leading '[', words split across newlines, multiple entries on one line, optional frames, NOT FOUND with explanations)
+const wrappedValidSample = `
+[===================== HISSA 1 — SHORT VIDEO TIME MAP
+=====================
+00:00.000 - 00:15.000 (0-360 frames): bluish green
+background with main character speaking to crowd.
+00:15.000 - 00:16.000 (360-384 frames): close up face shot.
+00:16.000 - 00:17.000 (384-408 frames): car driving away down the street.
+
+=====================
+HISSA 2 — MOVIE WINDOW ME HAR SEGMENT KI HUNT
+=====================
+Short 00:00.000 - 00:15.000 --> NOT FOUND — Scene 16 aur Scene 17 movie window ke bahar hain (05:00.000 ke baad ke scenes) Short 00:15.000 - 00:16.000 --> Movie 01:07.250 - 01:08.250 (1614-1638 frames) Short 00:16.000 - 00:17.000 --> Movie 01:08.250 - 01:09.250 (1638-1662 frames)
+`
+
+const resWrapped = validateStudioAnswer(wrappedValidSample, { shortWindowSec: 17 })
+assert.equal(resWrapped.ok, true, `Expected wrappedValidSample to pass, got reason=${resWrapped.reason}`)
+assert.equal(resWrapped.reason, 'ok')
+assert.equal(resWrapped.stats.matchLineCount, 2, 'Expected 2 match entries')
+assert.equal(resWrapped.stats.notFoundLineCount, 1, 'Expected 1 NOT FOUND entry')
+assert.equal(resWrapped.stats.totalValidHissa2Lines, 3, 'Expected 3 total valid entries')
+assert.equal(resWrapped.stats.reachedShortEnd, true)
+
 console.log('ALL studio-result-validator tests PASSED!')
+

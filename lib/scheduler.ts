@@ -1968,6 +1968,12 @@ class Scheduler {
           }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err)
+          const isUserStopped = msg === 'STOPPED BY USER' || /stopped by user/i.test(msg)
+          if (isUserStopped) {
+            addLog(scan, 'info', `${jobLabel}: STOPPED BY USER`)
+            this.mark(job)
+            return
+          }
           const isPolicy = msg.startsWith('POLICY_BLOCKED:') || /prohibited_content/i.test(msg)
           for (const seg of coveredSegs) {
             for (const ci of movieBlock.chunkIndexes) {
