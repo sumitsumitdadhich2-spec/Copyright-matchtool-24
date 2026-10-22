@@ -241,7 +241,28 @@ export const STUDIO_SELECTORS = {
     '[aria-label="Select" i]',
   ],
 
-  /** Attached video chips in the prompt composer */
+  /** Attached video chips in the prompt composer — valid standard CSS only (safe for document.querySelectorAll) */
+  videoMediaChipsCss: [
+    'ms-media-chunk',
+    'ms-video-chunk',
+    'ms-youtube-chunk',
+    'ms-chunk-chip',
+    'ms-prompt-chunk',
+    'ms-file-chunk',
+    'ms-drive-chunk',
+    '[data-test-id*="media-chunk" i]',
+    '[data-test-id*="chunk-chip" i]',
+    '[data-test-id*="prompt-chunk" i]',
+    '.media-chip',
+  ],
+
+  /** Attached video chips — Playwright-only selectors (:has-text) */
+  videoMediaChipsPw: [
+    '.chunk-chip:has-text(".mp4")',
+    '.chunk-chip:has-text("youtube")',
+  ],
+
+  /** Attached video chips in the prompt composer (combined CSS + Playwright) */
   videoMediaChips: [
     'ms-media-chunk',
     'ms-video-chunk',

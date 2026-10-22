@@ -1522,34 +1522,59 @@ class StudioBrowserController {
    * A chip = the nearest ancestor of that button that contains BOTH:
    *   - exactly one Edit button (button[aria-label="Edit video options" i] / video options)
    *   - and one Remove button (button[aria-label="Remove media" i]).
-   * Tags each detected chip with `data-cmt-fallback-chip="true"` (keeping ms-* selectors as primary).
+   * Tags each detected chip with `data-cmt-fallback-chip="true"` (keeping ms-* CSS selectors as primary).
    * No filename or "N tokens" text dependency.
    */
   private async syncFallbackMediaChips(page: Page, _uploadedBasename?: string): Promise<void> {
-    const primarySelector = STUDIO_SELECTORS.videoMediaChips.join(', ')
+    const primarySelector = STUDIO_SELECTORS.videoMediaChipsCss.join(', ')
     await page
       .evaluate((primarySel) => {
-        document
-          .querySelectorAll('[data-cmt-fallback-chip]')
-          .forEach((el) => el.removeAttribute('data-cmt-fallback-chip'))
+        try {
+          document
+            .querySelectorAll('[data-cmt-fallback-chip]')
+            .forEach((el) => el.removeAttribute('data-cmt-fallback-chip'))
+        } catch {
+          /* ignore */
+        }
 
-        const primarySet = new Set<Element>(
-          primarySel ? Array.from(document.querySelectorAll(primarySel)) : [],
-        )
+        const primarySet = new Set<Element>()
+        if (primarySel) {
+          try {
+            Array.from(document.querySelectorAll(primarySel)).forEach((el) => primarySet.add(el))
+          } catch {
+            /* ignore */
+          }
+        }
 
         const editBtnSel =
           'button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i], [role="button"][aria-label*="Edit video options" i]'
         const removeBtnSel =
           'button[aria-label="Remove media" i], button[aria-label*="Remove media" i], [role="button"][aria-label*="Remove media" i]'
 
-        const editButtons = Array.from(document.body.querySelectorAll(editBtnSel))
+        let editButtons: Element[] = []
+        try {
+          editButtons = Array.from(document.body.querySelectorAll(editBtnSel))
+        } catch {
+          editButtons = []
+        }
+
         const foundChips: Element[] = []
 
         for (const editBtn of editButtons) {
           let curr: Element | null = editBtn.parentElement
           for (let depth = 0; depth < 8 && curr && curr !== document.body; depth++) {
-            const editCount = curr.querySelectorAll(editBtnSel).length
-            const removeCount = curr.querySelectorAll(removeBtnSel).length
+            let editCount = 0
+            let removeCount = 0
+            try {
+              editCount = curr.querySelectorAll(editBtnSel).length
+            } catch {
+              editCount = 0
+            }
+            try {
+              removeCount = curr.querySelectorAll(removeBtnSel).length
+            } catch {
+              removeCount = 0
+            }
             if (editCount === 1 && removeCount === 1) {
               if (!foundChips.includes(curr)) {
                 foundChips.push(curr)
@@ -1566,12 +1591,27 @@ class StudioBrowserController {
 
         // Fallback if only Remove media + gear icon button exist inside the chip
         if (foundChips.length === 0) {
-          const removeButtons = Array.from(document.body.querySelectorAll(removeBtnSel))
+          let removeButtons: Element[] = []
+          try {
+            removeButtons = Array.from(document.body.querySelectorAll(removeBtnSel))
+          } catch {
+            removeButtons = []
+          }
           for (const remBtn of removeButtons) {
             let curr: Element | null = remBtn.parentElement
             for (let depth = 0; depth < 8 && curr && curr !== document.body; depth++) {
-              const removeCount = curr.querySelectorAll(removeBtnSel).length
-              const allBtns = curr.querySelectorAll('button, [role="button"]').length
+              let removeCount = 0
+              let allBtns = 0
+              try {
+                removeCount = curr.querySelectorAll(removeBtnSel).length
+              } catch {
+                removeCount = 0
+              }
+              try {
+                allBtns = curr.querySelectorAll('button, [role="button"]').length
+              } catch {
+                allBtns = 0
+              }
               if (removeCount === 1 && allBtns === 2) {
                 if (!foundChips.includes(curr)) {
                   foundChips.push(curr)
@@ -1593,7 +1633,49 @@ class StudioBrowserController {
           }
         }
       }, primarySelector)
-      .catch(() => {})
+      .catch((err: unknown) => {
+        this.logStep('chip sync error', (err as Error)?.message || String(err), 'warn')
+      })
+  }
+
+  /**
+   * Read the top header token count silently (without logging to step log on every poll tick).
+   */
+  private async readHeaderTokenCountSilent(page: Page): Promise<number> {
+    try {
+      return await page.evaluate(() => {
+        const isVisible = (el: Element | null): el is HTMLElement => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+        }
+
+        let headerTokens = 0
+        try {
+          const topNodes = Array.from(document.body.querySelectorAll('span, div, button, p'))
+          for (const node of topNodes) {
+            if (!isVisible(node)) continue
+            const r = node.getBoundingClientRect()
+            if (r.top < 0 || r.top > 120 || r.height > 65) continue
+            const txt = ((node as HTMLElement).innerText || node.textContent || '').trim()
+            if (txt.length > 80) continue
+            const m = txt.match(/([\d,]+)\s*(?:\/\s*[\d,]+\s*)?tokens?\b/i)
+            if (m) {
+              const val = parseInt(m[1].replace(/,/g, ''), 10)
+              if (Number.isFinite(val) && val > headerTokens) {
+                headerTokens = val
+              }
+            }
+          }
+        } catch {
+          /* ignore */
+        }
+        return headerTokens
+      })
+    } catch {
+      return 0
+    }
   }
 
   /**
@@ -1830,7 +1912,7 @@ class StudioBrowserController {
 
   /**
    * FIX 1: Attach a YouTube link or Drive file or local file as a video asset in the prompt,
-   * verify media chip count increased AND finished "Loading..." (gear icon visible),
+   * verify media chip count increased (or Remove media button count / header token count increased),
    * configure Start Time (e.g. 0s), End Time (e.g. 5m), and FPS = 24 via the Video Settings dialog,
    * READ BACK all three values to confirm they stuck, and click Save.
    */
@@ -1858,15 +1940,19 @@ class StudioBrowserController {
       (localFilePath ? path.basename(localFilePath) : '') ||
       (youtubeUrl ? 'youtube' : '')
 
-    // Combined locator: STUDIO_SELECTORS.videoMediaChips + fallback chip locator ([data-cmt-fallback-chip="true"])
+    // Combined locator: videoMediaChipsCss + videoMediaChipsPw + fallback chip locator ([data-cmt-fallback-chip="true"])
     const combinedChipSelector = [
-      ...STUDIO_SELECTORS.videoMediaChips,
+      ...STUDIO_SELECTORS.videoMediaChipsCss,
+      ...STUDIO_SELECTORS.videoMediaChipsPw,
       '[data-cmt-fallback-chip="true"]',
     ].join(', ')
     const chipsLocator = page.locator(combinedChipSelector)
+    const removeMediaBtnLocator = page.locator('button[aria-label="Remove media" i]')
 
     await this.syncFallbackMediaChips(page)
     const chipsBefore = await chipsLocator.count()
+    const removeBefore = await removeMediaBtnLocator.count().catch(() => 0)
+    const headerTokensBefore = await this.readHeaderTokenCountSilent(page)
 
     if (youtubeUrl) {
       // Option 1: Try Insert (+) -> YouTube URL modal, or direct paste into prompt input
@@ -1967,32 +2053,76 @@ class StudioBrowserController {
       throw new Error(`No media source available to attach ${label} video in Studio`)
     }
 
-    // FIX 1a: Wait for the new video chip to appear AND finish "Loading..." (so its gear button "Edit video options" is present)
+    // FIX 1a: Wait for the new video chip to appear (via chip count increase OR second success signal:
+    // button[aria-label="Remove media" i] count increased OR header token count increased)
+    // AND wait until the chip finishes "Loading..." so its gear button ("Edit video options") is ready.
     const waitDeadline = Date.now() + 90_000
     let chipCount = chipsBefore
+    let removeAfter = removeBefore
+    let headerTokensAfter = headerTokensBefore
+    let attachSucceeded = false
+
     while (Date.now() < waitDeadline) {
       await this.waitIfPausedOrThrowIfStopped(scope)
       await this.syncFallbackMediaChips(page)
       chipCount = await chipsLocator.count()
-      if (chipCount > chipsBefore) {
-        const candidateChip = chipsLocator.nth(chipsBefore)
-        const chipText = ((await candidateChip.innerText().catch(() => '')) || '').trim()
-        const gearBtnCount = await candidateChip
-          .locator('button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i]')
-          .count()
-          .catch(() => 0)
-        // As shown in video 01:54 -> 01:56, while "Loading..." is displayed the gear icon is not ready yet
-        if (gearBtnCount > 0 || !/\bloading\b/i.test(chipText)) {
-          break
+      removeAfter = await removeMediaBtnLocator.count().catch(() => 0)
+      headerTokensAfter = await this.readHeaderTokenCountSilent(page)
+
+      const primarySignal = chipCount > chipsBefore
+      const secondarySignal =
+        removeAfter > removeBefore || (headerTokensAfter > headerTokensBefore && headerTokensAfter > 0)
+
+      if (primarySignal || secondarySignal) {
+        if (chipCount > chipsBefore) {
+          const candidateChip = chipsLocator.nth(chipsBefore)
+          const chipText = ((await candidateChip.innerText().catch(() => '')) || '').trim()
+          const gearBtnCount = await candidateChip
+            .locator(
+              'button[aria-label*="Edit video options" i], button[aria-label*="Video options" i], button[aria-label*="Video settings" i]',
+            )
+            .count()
+            .catch(() => 0)
+          // As shown in video 01:54 -> 01:56, while "Loading..." is displayed the gear icon is not ready yet
+          if (gearBtnCount > 0 || !/\bloading\b/i.test(chipText)) {
+            attachSucceeded = true
+            break
+          }
+        } else {
+          // Secondary signal triggered while chip is still Loading... — wait until Edit video options button appears and syncs
+          const editBtnCountOnPage = await page
+            .locator('button[aria-label="Edit video options" i], button[aria-label*="Edit video options" i]')
+            .count()
+            .catch(() => 0)
+          if (editBtnCountOnPage > chipsBefore) {
+            await this.syncFallbackMediaChips(page)
+            chipCount = await chipsLocator.count()
+            attachSucceeded = true
+            break
+          }
         }
       }
       await new Promise((r) => setTimeout(r, 500))
     }
 
-    if (chipCount <= chipsBefore) {
+    if (!attachSucceeded) {
+      await this.syncFallbackMediaChips(page)
+      chipCount = await chipsLocator.count()
+      removeAfter = await removeMediaBtnLocator.count().catch(() => 0)
+      headerTokensAfter = await this.readHeaderTokenCountSilent(page)
+      if (
+        chipCount > chipsBefore ||
+        removeAfter > removeBefore ||
+        (headerTokensAfter > headerTokensBefore && headerTokensAfter > 0)
+      ) {
+        attachSucceeded = true
+      }
+    }
+
+    if (!attachSucceeded) {
       await this.dumpChipAttachDiagnostics(page, label, uploadedBasename)
       throw new Error(
-        `Studio video attach failed for ${label}: media chip count did not increase within 90s (before=${chipsBefore}, after=${chipCount})`,
+        `Studio video attach failed for ${label}: media chip count did not increase within 90s (before=${chipsBefore}, after=${chipCount}, removeBefore=${removeBefore}, removeAfter=${removeAfter}, tokensBefore=${headerTokensBefore}, tokensAfter=${headerTokensAfter})`,
       )
     }
 
