@@ -1,14 +1,93 @@
 import { NextRequest, NextResponse } from 'next/server'
+import fs from 'fs'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import { getSession } from '@/lib/users'
 import { studioController } from '@/lib/studio-automation'
 import { prepareStudioMovie360pAndDrive } from '@/lib/media'
+import { getScan } from '@/lib/store'
+import { loadStudioUserConfig, saveUserGoogleCookies } from '@/lib/studio-settings'
+import { getFfmpegPathSync } from '@/lib/ffmpeg-bin'
+import { CHUNK_MAP_PROMPT, parseChunkMatches } from '@/lib/gemini'
+
+const execFileAsync = promisify(execFile)
+
+async function ensureSyntheticTestVideos(): Promise<{ moviePath: string; shortPath: string }> {
+  const ffmpegBin = getFfmpegPathSync()
+  const moviePath = '/tmp/cmt_studio_test_movie_360p.mp4'
+  const shortPath = '/tmp/cmt_studio_test_short.mp4'
+  if (!fs.existsSync(moviePath) || fs.statSync(moviePath).size < 10_000) {
+    await execFileAsync(ffmpegBin, [
+      '-y',
+      '-f',
+      'lavfi',
+      '-i',
+      'testsrc2=size=640x360:rate=24:duration=30',
+      '-f',
+      'lavfi',
+      '-i',
+      'sine=frequency=440:sample_rate=48000:duration=30',
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-pix_fmt',
+      'yuv420p',
+      '-r',
+      '24',
+      '-c:a',
+      'aac',
+      '-ac',
+      '1',
+      '-b:a',
+      '48k',
+      moviePath,
+    ])
+  }
+  if (!fs.existsSync(shortPath) || fs.statSync(shortPath).size < 5_000) {
+    await execFileAsync(ffmpegBin, [
+      '-y',
+      '-ss',
+      '10',
+      '-t',
+      '10',
+      '-i',
+      moviePath,
+      '-c:v',
+      'libx264',
+      '-preset',
+      'ultrafast',
+      '-pix_fmt',
+      'yuv420p',
+      '-r',
+      '24',
+      '-c:a',
+      'aac',
+      '-ac',
+      '1',
+      '-b:a',
+      '48k',
+      shortPath,
+    ])
+  }
+  return { moviePath, shortPath }
+}
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 export async function POST(req: NextRequest) {
-  const user = await getSession()
-  const username = user?.username || 'admin'
+  const session = await getSession()
+  if (!session) {
+    return NextResponse.json({ ok: false, error: 'Not authenticated' }, { status: 401 })
+  }
+  if (!studioController.canUserAccessStudio(session)) {
+    return NextResponse.json(
+      { ok: false, error: 'Forbidden: Studio browser is currently loaded for another user' },
+      { status: 403 },
+    )
+  }
+  const username = session.username
 
   const body = (await req.json().catch(() => ({}))) as {
     action?: string
@@ -19,10 +98,69 @@ export async function POST(req: NextRequest) {
     url?: string
     enabled?: boolean
     scanId?: string
+    cookiesJson?: string
   }
 
   try {
     switch (body.action) {
+      case 'save_cookies': {
+        if (!body.cookiesJson || !body.cookiesJson.trim()) {
+          return NextResponse.json({ ok: false, error: 'Paste Cookie-Editor JSON first' }, { status: 400 })
+        }
+        const saved = await saveUserGoogleCookies(username, body.cookiesJson)
+        return NextResponse.json({
+          ok: true,
+          cookieCount: saved.count,
+          snapshot: await studioController.getSnapshot(false),
+        })
+      }
+      case 'run_test_window': {
+        const cfg = await loadStudioUserConfig(username)
+        const { moviePath, shortPath } = await ensureSyntheticTestVideos()
+        void (async () => {
+          const release = await studioController.acquireJobLock('test-scan', username)
+          try {
+            const res = await studioController.runWindowJob({
+              username,
+              scanId: 'test-scan',
+              jobLabel: '1-Video Studio Chunk Test (10s Short + 30s Movie @ 24fps)',
+              modelName: cfg.studioModelName || 'Gemini 2.5 Pro',
+              maxOutputTokens: cfg.studioMaxOutputTokens || 65536,
+              shortSource: {
+                kind: 'local',
+                filePath: shortPath,
+                startSec: 0,
+                endSec: 10,
+              },
+              movieSource: {
+                filePath: moviePath,
+                startSec: 0,
+                endSec: 30,
+              },
+              promptText: CHUNK_MAP_PROMPT,
+              maxTokensPerRequest: 900_000,
+              offsetMode: cfg.studioOffsetMode || 'auto',
+            })
+            if (res.status === 'ok') {
+              const matches = parseChunkMatches(res.rawText, 0, 0, 10, 30)
+              console.log(
+                `[Studio 1-Video Test] SUCCESS: status=ok, tokens=${res.tokenCount}, matches=${matches.length}, raw=${JSON.stringify(res.rawText.slice(0, 300))}`,
+              )
+            } else {
+              console.warn(`[Studio 1-Video Test] ENDED: status=${res.status}, error=${res.error}`)
+            }
+          } catch (err) {
+            console.error('[Studio 1-Video Test] ERROR:', err)
+          } finally {
+            release()
+          }
+        })()
+        return NextResponse.json({
+          ok: true,
+          started: true,
+          snapshot: await studioController.getSnapshot(true),
+        })
+      }
       case 'test_login': {
         const res = await studioController.testLogin(username)
         const snap = await studioController.getSnapshot(true)
@@ -37,7 +175,10 @@ export async function POST(req: NextRequest) {
         return NextResponse.json({ ok: true, snapshot: await studioController.getSnapshot(false) })
       }
       case 'stop': {
-        studioController.requestStop()
+        studioController.requestStop({
+          scanId: body.scanId,
+          username: session.role === 'admin' ? undefined : username,
+        })
         return NextResponse.json({ ok: true, snapshot: await studioController.getSnapshot(false) })
       }
       case 'assist_toggle': {
@@ -87,7 +228,17 @@ export async function POST(req: NextRequest) {
         if (!body.scanId) {
           return NextResponse.json({ ok: false, error: 'Missing scanId' }, { status: 400 })
         }
-        void prepareStudioMovie360pAndDrive(body.scanId, undefined, undefined, username)
+        const scan = getScan(body.scanId)
+        if (!scan) {
+          return NextResponse.json({ ok: false, error: 'Scan not found' }, { status: 404 })
+        }
+        if (session.role !== 'admin' && scan.ownerUsername && scan.ownerUsername !== username) {
+          return NextResponse.json(
+            { ok: false, error: 'Forbidden: scan belongs to another user' },
+            { status: 403 },
+          )
+        }
+        void prepareStudioMovie360pAndDrive(body.scanId, undefined, undefined, scan.ownerUsername || username)
         return NextResponse.json({ ok: true })
       }
       default:

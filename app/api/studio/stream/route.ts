@@ -1,10 +1,22 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { studioController } from '@/lib/studio-automation'
+import { getSession } from '@/lib/users'
 
 export const runtime = 'nodejs'
 export const dynamic = 'force-dynamic'
 
 export async function GET(req: NextRequest) {
+  const session = await getSession()
+  if (!session) {
+    return NextResponse.json({ ok: false, error: 'Not authenticated' }, { status: 401 })
+  }
+  if (!studioController.canUserAccessStudio(session)) {
+    return NextResponse.json(
+      { ok: false, error: 'Forbidden: Studio browser is currently loaded for another user' },
+      { status: 403 },
+    )
+  }
+
   const once = req.nextUrl.searchParams.get('once') === '1'
   if (once) {
     const snap = await studioController.getSnapshot(true)

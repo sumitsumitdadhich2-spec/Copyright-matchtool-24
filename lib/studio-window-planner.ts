@@ -1,6 +1,6 @@
 import { chunkAbsWindow } from './segment-range'
 import { fmtTime } from './format'
-import type { Scan, ShortSegmentState } from './types'
+import type { ChunkMatch, Scan, ShortSegmentState } from './types'
 
 export interface StudioShortPart {
   partIndex: number
@@ -34,6 +34,8 @@ export interface StudioScanJobPlan {
   jobIndex: number
   shortPart: StudioShortPart
   movieBlock: StudioMovieBlock
+  /** Number of times this job's movieBlock has been split due to >900K tokens (max 3) */
+  shrinkLevel?: number
 }
 
 export interface WindowPlannerOptions {
@@ -50,7 +52,7 @@ export interface WindowPlannerOptions {
  * floor((movieStart - trimStart) / 60), clamped to valid chunk range.
  */
 export function deriveChunkIndexForMovieTime(
-  scan: Scan,
+  scan: Pick<Scan, 'movieTrimStart' | 'chunkCount'>,
   movieStartSec: number,
   fallbackChunkIndexes?: number[],
 ): number {
@@ -73,6 +75,63 @@ export function deriveChunkIndexForMovieTime(
     return best
   }
   return clamped
+}
+
+/**
+ * Clip a ChunkMatch to a 60s short segment boundary [segStart, segEnd] and shift
+ * movieStart / movieEnd by the corresponding amount (1:1 when speed ratio is 1,
+ * or proportional to movieDuration / shortDuration when ratio != 1).
+ * Returns null if the match does not overlap [segStart, segEnd] or the clipped piece is < 0.05s.
+ */
+export function clipMatchToShortSegment(
+  match: ChunkMatch,
+  segStart: number,
+  segEnd: number,
+  scan?: Pick<Scan, 'movieTrimStart' | 'chunkCount'>,
+  fallbackChunkIndexes?: number[],
+): ChunkMatch | null {
+  const origShortDur = match.shortEnd - match.shortStart
+  const origMovieDur = match.movieEnd - match.movieStart
+  if (origShortDur <= 0 || match.shortEnd <= segStart || match.shortStart >= segEnd) {
+    return null
+  }
+
+  const clippedShortStart = Math.max(segStart, match.shortStart)
+  const clippedShortEnd = Math.min(segEnd, match.shortEnd)
+  const clippedShortDur = clippedShortEnd - clippedShortStart
+
+  // Drop pieces shorter than ~0.05 s
+  if (clippedShortDur < 0.05) {
+    return null
+  }
+
+  const deltaStart = clippedShortStart - match.shortStart
+  const deltaEnd = match.shortEnd - clippedShortEnd
+  const speedRatio =
+    origShortDur > 0 && origMovieDur > 0
+      ? Math.abs(origMovieDur - origShortDur) < 1e-6
+        ? 1
+        : origMovieDur / origShortDur
+      : 1
+
+  const clippedMovieStart = Number((match.movieStart + deltaStart * speedRatio).toFixed(3))
+  const clippedMovieEnd = Number((match.movieEnd - deltaEnd * speedRatio).toFixed(3))
+  if (clippedMovieEnd - clippedMovieStart < 0.02) {
+    return null
+  }
+
+  const updatedChunkIndex = scan
+    ? deriveChunkIndexForMovieTime(scan, clippedMovieStart, fallbackChunkIndexes)
+    : match.chunkIndex
+
+  return {
+    ...match,
+    shortStart: Number(clippedShortStart.toFixed(3)),
+    shortEnd: Number(clippedShortEnd.toFixed(3)),
+    movieStart: clippedMovieStart,
+    movieEnd: clippedMovieEnd,
+    chunkIndex: updatedChunkIndex,
+  }
 }
 
 /**

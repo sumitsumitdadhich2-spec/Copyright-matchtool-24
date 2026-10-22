@@ -247,6 +247,7 @@ export const STUDIO_SELECTORS = {
   /** Inside Video Settings popover/dialog: Start time, End time, FPS inputs */
   videoStartTimeInput: [
     'input[aria-label*="Start time" i]',
+    'input[aria-label*="Start offset" i]',
     'input[aria-label*="Start" i]',
     'input[placeholder*="00:00" i]:nth-of-type(1)',
     'mat-dialog-container input[type="text"]:nth-of-type(1)',
@@ -255,6 +256,7 @@ export const STUDIO_SELECTORS = {
 
   videoEndTimeInput: [
     'input[aria-label*="End time" i]',
+    'input[aria-label*="End offset" i]',
     'input[aria-label*="End" i]',
     'mat-dialog-container input[type="text"]:nth-of-type(2)',
     '.video-settings-container input:nth-of-type(2)',
@@ -266,6 +268,7 @@ export const STUDIO_SELECTORS = {
     'input[aria-label*="frames per second" i]',
     'input[type="number"][aria-label*="frame" i]',
     'mat-dialog-container input[type="number"]',
+    '.video-settings-container input[type="number"]',
   ],
 
   videoSettingsSaveButton: [
@@ -309,14 +312,13 @@ export const STUDIO_SELECTORS = {
     'button.stop-button',
   ],
 
-  /** Error / Quota / Rate Limit / Safety Block banners */
+  /** Strict Error / Quota / Rate Limit / Safety Block alert containers only */
   errorBanners: [
     '[role="alert"]',
-    '.mat-mdc-snack-bar-label',
     'ms-error-banner',
     '.error-banner',
-    '.model-error',
-    'ms-chat-turn .error-message',
+    '.mat-mdc-snack-bar-container [role="alert"]',
+    '.mat-mdc-snack-bar-label',
   ],
 
   /** Model response turn containers (last one is the latest answer) */

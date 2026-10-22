@@ -47,17 +47,26 @@ class StudioBrowserController {
   private page: Page | null = null
   private launching: Promise<Page> | null = null
   private paused = false
-  private stopRequested = false
+  private stoppedScanIds = new Set<string>()
+  private stoppedUsernames = new Set<string>()
   private assistMode = false
   private currentStep = 'idle'
   private scanId: string | null = null
+  private activeUsername: string | null = null
   private jobLabel: string | null = null
   private tokenCount: number | null = null
   private jobStartedAt: number | null = null
   private lastScreenshotB64: string | null = null
   private lastScreenshotAt: number | null = null
+  private screenshotInFlight: Promise<void> | null = null
   private logs: StudioStepLog[] = []
   private lastInjectedCookieUser: string | null = null
+  private jobLockBusy = false
+  private jobLockQueue: Array<{
+    scanId: string
+    username: string
+    grant: () => void
+  }> = []
 
   public logStep(
     step: string,
@@ -76,13 +85,72 @@ class StudioBrowserController {
     }
   }
 
-  public setJobContext(scanId: string | null, jobLabel: string | null) {
+  public setJobContext(scanId: string | null, jobLabel: string | null, username?: string | null) {
     this.scanId = scanId
     this.jobLabel = jobLabel
+    if (username !== undefined) this.activeUsername = username
     this.jobStartedAt = scanId ? Date.now() : null
     if (!scanId) {
       this.tokenCount = null
       this.currentStep = 'idle'
+      this.activeUsername = null
+    }
+  }
+
+  public getActiveScanId(): string | null {
+    return this.scanId
+  }
+
+  public getLoadedCookieUser(): string | null {
+    return this.lastInjectedCookieUser || this.activeUsername
+  }
+
+  /**
+   * FIX 6: Only allow the admin role OR the user whose cookies are currently loaded in the browser.
+   */
+  public canUserAccessStudio(session: { username: string; role: 'admin' | 'user' } | null): boolean {
+    if (!session) return false
+    if (session.role === 'admin') return true
+    const cookieOwner = this.getLoadedCookieUser()
+    return Boolean(cookieOwner && cookieOwner === session.username)
+  }
+
+  /**
+   * FIX 6: Simple guard so only ONE Studio job runs at a time across all users (single shared browser).
+   * Queues subsequent jobs in FIFO order and logs their queue position.
+   */
+  public async acquireJobLock(
+    scanId: string,
+    username: string,
+    onQueued?: (position: number, msg: string) => void,
+  ): Promise<() => void> {
+    if (!this.jobLockBusy) {
+      this.jobLockBusy = true
+      return () => this.releaseJobLock()
+    }
+
+    const position = this.jobLockQueue.length + 1
+    const waitMsg = `Studio browser is currently busy (active scan ${this.scanId || 'running'}) — queued at position #${position}, waiting for browser lock...`
+    this.logStep('queued', waitMsg, 'info')
+    onQueued?.(position, waitMsg)
+
+    await new Promise<void>((resolve) => {
+      this.jobLockQueue.push({
+        scanId,
+        username,
+        grant: resolve,
+      })
+    })
+
+    return () => this.releaseJobLock()
+  }
+
+  private releaseJobLock() {
+    const next = this.jobLockQueue.shift()
+    if (next) {
+      next.grant()
+    } else {
+      this.jobLockBusy = false
     }
   }
 
@@ -95,18 +163,43 @@ class StudioBrowserController {
     return this.paused
   }
 
-  public requestStop() {
-    this.stopRequested = true
-    this.paused = false
-    this.logStep('stopping', 'Stop requested by user', 'warn')
+  /**
+   * FIX 6: Scope stop flag by scanId and/or username so stopping one job never stops everyone globally.
+   */
+  public requestStop(scope?: { scanId?: string | null; username?: string | null }) {
+    const targetScanId = scope?.scanId ?? this.scanId
+    const targetUsername = scope?.username ?? null
+    if (targetScanId) this.stoppedScanIds.add(targetScanId)
+    if (targetUsername) this.stoppedUsernames.add(targetUsername)
+    if (
+      (!targetScanId && !targetUsername) ||
+      (targetScanId && targetScanId === this.scanId) ||
+      (targetUsername && targetUsername === this.activeUsername)
+    ) {
+      this.paused = false
+    }
+    this.logStep(
+      'stopping',
+      `Stop requested (${targetScanId ? `scan ${targetScanId}` : targetUsername ? `user ${targetUsername}` : 'active job'})`,
+      'warn',
+    )
   }
 
-  public clearStop() {
-    this.stopRequested = false
+  public clearStop(scope?: { scanId?: string | null; username?: string | null }) {
+    if (scope?.scanId) this.stoppedScanIds.delete(scope.scanId)
+    if (scope?.username) this.stoppedUsernames.delete(scope.username)
+    if (!scope?.scanId && !scope?.username) {
+      this.stoppedScanIds.clear()
+      this.stoppedUsernames.clear()
+    }
   }
 
-  public isStopping(): boolean {
-    return this.stopRequested
+  public isStopping(scope?: { scanId?: string | null; username?: string | null }): boolean {
+    const checkScanId = scope?.scanId ?? this.scanId
+    const checkUsername = scope?.username ?? this.activeUsername
+    if (checkScanId && this.stoppedScanIds.has(checkScanId)) return true
+    if (checkUsername && this.stoppedUsernames.has(checkUsername)) return true
+    return false
   }
 
   public setAssistMode(val: boolean) {
@@ -114,11 +207,11 @@ class StudioBrowserController {
     this.logStep(val ? 'login assist ON' : 'login assist OFF', undefined, 'info')
   }
 
-  public async waitIfPausedOrThrowIfStopped() {
-    while (this.paused && !this.stopRequested) {
+  public async waitIfPausedOrThrowIfStopped(scope?: { scanId?: string | null; username?: string | null }) {
+    while (this.paused && !this.isStopping(scope)) {
       await new Promise((r) => setTimeout(r, 400))
     }
-    if (this.stopRequested) {
+    if (this.isStopping(scope)) {
       throw new Error('Studio scan stopped by user')
     }
   }
@@ -195,21 +288,32 @@ class StudioBrowserController {
     }
   }
 
+  /**
+   * FIX 6: Capture at most ONE screenshot per second TOTAL across all connected SSE clients.
+   */
   public async getSnapshot(captureFresh = true): Promise<StudioLiveSnapshot> {
     if (captureFresh && this.page && !this.page.isClosed()) {
       const now = Date.now()
-      if (!this.lastScreenshotAt || now - this.lastScreenshotAt >= 750) {
-        try {
-          const buf = await this.page.screenshot({
-            type: 'jpeg',
-            quality: 62,
-            timeout: 2500,
-          })
-          this.lastScreenshotB64 = buf.toString('base64')
-          this.lastScreenshotAt = now
-        } catch {
-          /* ignore screenshot race while navigating */
+      if (!this.lastScreenshotAt || now - this.lastScreenshotAt >= 1000) {
+        if (!this.screenshotInFlight) {
+          this.screenshotInFlight = (async () => {
+            try {
+              if (!this.page || this.page.isClosed()) return
+              const buf = await this.page.screenshot({
+                type: 'jpeg',
+                quality: 62,
+                timeout: 2500,
+              })
+              this.lastScreenshotB64 = buf.toString('base64')
+              this.lastScreenshotAt = Date.now()
+            } catch {
+              /* ignore screenshot race while navigating */
+            } finally {
+              this.screenshotInFlight = null
+            }
+          })()
         }
+        await this.screenshotInFlight
       }
     }
 
@@ -368,14 +472,49 @@ class StudioBrowserController {
   }
 
   /**
+   * Parse a clock/time string read back from Studio's video settings input
+   * (e.g. "05:00", "1:05:00", "300", "05m 00s") into seconds.
+   */
+  private parseStudioClockToSec(raw: string | null | undefined): number | null {
+    if (!raw) return null
+    const str = raw.trim()
+    if (!str) return null
+
+    // HH:MM:SS or MM:SS
+    const colonParts = str.split(':').map((p) => p.trim())
+    if (colonParts.length === 2 || colonParts.length === 3) {
+      const nums = colonParts.map((p) => Number(p))
+      if (nums.every((n) => Number.isFinite(n) && n >= 0)) {
+        if (nums.length === 3) return nums[0] * 3600 + nums[1] * 60 + nums[2]
+        return nums[0] * 60 + nums[1]
+      }
+    }
+
+    // e.g. "5m 30s" or "120s"
+    const msMatch = str.match(/^(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+(?:\.\d+)?)\s*s?)?$/i)
+    if (msMatch && (msMatch[1] || msMatch[2] || msMatch[3])) {
+      const h = msMatch[1] ? Number(msMatch[1]) : 0
+      const m = msMatch[2] ? Number(msMatch[2]) : 0
+      const s = msMatch[3] ? Number(msMatch[3]) : 0
+      if (Number.isFinite(h) && Number.isFinite(m) && Number.isFinite(s)) {
+        return h * 3600 + m * 60 + s
+      }
+    }
+
+    const plain = Number(str)
+    return Number.isFinite(plain) && plain >= 0 ? plain : null
+  }
+
+  /**
    * Step (b): Configure model name, temperature = 0, thinking level = High,
    * max output tokens, media resolution (~65 tokens/frame = Low), and safety settings all OFF.
    */
   private async configureRunSettings(
     page: Page,
     config: { modelName: string; maxOutputTokens: number },
+    scope?: { scanId?: string | null; username?: string | null },
   ) {
-    await this.waitIfPausedOrThrowIfStopped()
+    await this.waitIfPausedOrThrowIfStopped(scope)
 
     // Ensure Run Settings panel is open
     const tempLocCheck = await findFirstVisibleLocator(page, STUDIO_SELECTORS.temperatureInput, 1500)
@@ -512,8 +651,10 @@ class StudioBrowserController {
   }
 
   /**
-   * Attach a YouTube link or Drive file or local file as a video asset in the prompt,
-   * and configure its Start Time, End Time, and FPS = 24 via the Video Settings dialog.
+   * FIX 1: Attach a YouTube link or Drive file or local file as a video asset in the prompt,
+   * verify media chip count increased, verify the added chip matches the intended video,
+   * configure Start Time, End Time, and FPS = 24 via the Video Settings dialog,
+   * and READ BACK all three values to confirm they stuck (retrying the dialog once, then THROWING).
    */
   private async attachVideoAndConfigureRange(
     page: Page,
@@ -525,12 +666,15 @@ class StudioBrowserController {
       startSec: number
       endSec: number
       fps: number
+      scope?: { scanId?: string | null; username?: string | null }
     },
   ) {
-    await this.waitIfPausedOrThrowIfStopped()
-    const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps } = params
+    const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
+    await this.waitIfPausedOrThrowIfStopped(scope)
 
-    const chipsBefore = await page.locator(STUDIO_SELECTORS.videoMediaChips.join(', ')).count()
+    const chipSelector = STUDIO_SELECTORS.videoMediaChips.join(', ')
+    const chipsLocator = page.locator(chipSelector)
+    const chipsBefore = await chipsLocator.count()
 
     if (youtubeUrl) {
       // Option 1: Try Insert (+) -> YouTube URL modal, or direct paste into prompt input
@@ -631,72 +775,160 @@ class StudioBrowserController {
       throw new Error(`No media source available to attach ${label} video in Studio`)
     }
 
-    // Wait for the new video chip to appear and finish tokenizing/loading
+    // FIX 1a: Wait for the new video chip to appear, and THROW if chip count did not increase
     const waitDeadline = Date.now() + 90_000
     let chipCount = chipsBefore
     while (Date.now() < waitDeadline) {
-      await this.waitIfPausedOrThrowIfStopped()
-      chipCount = await page.locator(STUDIO_SELECTORS.videoMediaChips.join(', ')).count()
+      await this.waitIfPausedOrThrowIfStopped(scope)
+      chipCount = await chipsLocator.count()
       if (chipCount > chipsBefore) break
       await new Promise((r) => setTimeout(r, 500))
     }
 
-    // Open Video Settings on the newly added video chip to set start/end time & FPS = 24
+    if (chipCount <= chipsBefore) {
+      throw new Error(
+        `Studio video attach failed for ${label}: media chip count did not increase within 90s (before=${chipsBefore}, after=${chipCount})`,
+      )
+    }
+
+    // FIX 1b: Target the chip we just added (at index chipsBefore, or matching expected name among newly added chips)
+    const expectedNameHint = (
+      driveFileName ||
+      (localFilePath ? path.basename(localFilePath) : '') ||
+      (youtubeUrl ? 'youtube' : '')
+    ).toLowerCase()
+
+    let targetChipIndex = chipsBefore
+    if (expectedNameHint) {
+      for (let idx = chipsBefore; idx < chipCount; idx++) {
+        const candidate = chipsLocator.nth(idx)
+        const text = (
+          (await candidate.innerText().catch(() => '')) +
+          ' ' +
+          ((await candidate.getAttribute('aria-label').catch(() => '')) || '') +
+          ' ' +
+          ((await candidate.getAttribute('title').catch(() => '')) || '')
+        ).toLowerCase()
+        if (text.includes(expectedNameHint.slice(0, 12))) {
+          targetChipIndex = idx
+          break
+        }
+      }
+    }
+
+    const targetChip = chipsLocator.nth(targetChipIndex)
+    if ((await targetChip.count()) === 0) {
+      throw new Error(`Studio clip config failed: target media chip #${targetChipIndex} for ${label} not found`)
+    }
+
+    // Verify the chip does not belong to the wrong video when attaching the second video (movie)
+    if (label === 'movie' && targetChipIndex === 0 && chipsBefore >= 1) {
+      throw new Error(`Studio clip config failed: movie chip resolved to index 0 (short video chip)`)
+    }
+
+    // FIX 1c: Open Video Settings on targetChip, set start / end / FPS, and READ BACK all three values.
+    // Retry the dialog once if any input is missing or any value did not stick, then THROW.
     const startStr = this.formatClockForStudioInput(startSec)
     const endStr = this.formatClockForStudioInput(endSec)
+    let lastConfigError = ''
 
-    try {
-      const chips = page.locator(STUDIO_SELECTORS.videoMediaChips.join(', '))
-      const targetChip = chips.nth(Math.max(0, chipCount - 1))
-      if ((await targetChip.count()) > 0) {
-        await targetChip.hover().catch(() => {})
-        await new Promise((r) => setTimeout(r, 250))
+    for (let dialogAttempt = 1; dialogAttempt <= 2; dialogAttempt++) {
+      await this.waitIfPausedOrThrowIfStopped(scope)
+      lastConfigError = ''
 
-        // Click either the settings icon inside the chip or the chip itself
+      await targetChip.scrollIntoViewIfNeeded().catch(() => {})
+      await targetChip.hover().catch(() => {})
+      await new Promise((r) => setTimeout(r, 250))
+
+      // Prefer explicit video settings button inside the chip, fallback to first button or chip click
+      let openedDialog = false
+      for (const btnSel of STUDIO_SELECTORS.videoChipSettingsButton) {
+        const btn = targetChip.locator(btnSel).first()
+        if ((await btn.count()) > 0 && (await btn.isVisible().catch(() => false))) {
+          await btn.click()
+          openedDialog = true
+          break
+        }
+      }
+      if (!openedDialog) {
         const settingsBtnInside = targetChip.locator('button').first()
         if ((await settingsBtnInside.count()) > 0) {
           await settingsBtnInside.click()
         } else {
           await targetChip.click()
         }
-        await new Promise((r) => setTimeout(r, 500))
-
-        const startInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoStartTimeInput, 2500)
-        const endInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoEndTimeInput, 2500)
-        const fpsInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoFpsInput, 2500)
-
-        if (startInput) {
-          await startInput.click({ clickCount: 3 })
-          await startInput.fill(startStr)
-        }
-        if (endInput) {
-          await endInput.click({ clickCount: 3 })
-          await endInput.fill(endStr)
-        }
-        if (fpsInput) {
-          await fpsInput.click({ clickCount: 3 })
-          await fpsInput.fill(String(fps))
-        }
-
-        const saveBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoSettingsSaveButton, 1800)
-        if (saveBtn) {
-          await saveBtn.click()
-        } else {
-          await page.keyboard.press('Escape')
-        }
-        await new Promise((r) => setTimeout(r, 600))
       }
-    } catch (err) {
+      await new Promise((r) => setTimeout(r, 600))
+
+      const startInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoStartTimeInput, 2500)
+      const endInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoEndTimeInput, 2500)
+      const fpsInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoFpsInput, 2500)
+
+      if (!startInput) {
+        lastConfigError = `start time input not found for ${label}`
+      } else if (!endInput) {
+        lastConfigError = `end time input not found for ${label}`
+      } else if (!fpsInput) {
+        lastConfigError = `fps input not found for ${label}`
+      } else {
+        await startInput.click({ clickCount: 3 })
+        await startInput.fill(startStr)
+        await startInput.dispatchEvent('change').catch(() => {})
+
+        await endInput.click({ clickCount: 3 })
+        await endInput.fill(endStr)
+        await endInput.dispatchEvent('change').catch(() => {})
+
+        await fpsInput.click({ clickCount: 3 })
+        await fpsInput.fill(String(fps))
+        await fpsInput.dispatchEvent('change').catch(() => {})
+        await fpsInput.press('Tab').catch(() => {})
+        await new Promise((r) => setTimeout(r, 250))
+
+        // Read back the three values from the dialog before closing
+        const readStartRaw = await startInput.inputValue().catch(() => '')
+        const readEndRaw = await endInput.inputValue().catch(() => '')
+        const readFpsRaw = await fpsInput.inputValue().catch(() => '')
+
+        const readStartSec = this.parseStudioClockToSec(readStartRaw)
+        const readEndSec = this.parseStudioClockToSec(readEndRaw)
+        const readFps = Number(readFpsRaw.trim())
+
+        if (!Number.isFinite(readFps) || Math.abs(readFps - fps) > 0.01) {
+          lastConfigError = `fps (expected ${fps}, read back "${readFpsRaw}") on ${label}`
+        } else if (readStartSec === null || Math.abs(readStartSec - Math.floor(startSec)) > 1) {
+          lastConfigError = `start time (expected ${startStr} [${Math.floor(startSec)}s], read back "${readStartRaw}") on ${label}`
+        } else if (readEndSec === null || Math.abs(readEndSec - Math.floor(endSec)) > 1) {
+          lastConfigError = `end time (expected ${endStr} [${Math.floor(endSec)}s], read back "${readEndRaw}") on ${label}`
+        }
+      }
+
+      // Close/save the dialog
+      const saveBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.videoSettingsSaveButton, 1500)
+      if (saveBtn) {
+        await saveBtn.click().catch(() => {})
+      } else {
+        await page.keyboard.press('Escape').catch(() => {})
+      }
+      await new Promise((r) => setTimeout(r, 500))
+
+      if (!lastConfigError) {
+        break
+      }
+
       this.logStep(
-        `${label} clip range warning`,
-        `Could not set clip dialog (${ err instanceof Error ? err.message : String(err) })`,
+        `${label} clip config retry ${dialogAttempt}/2`,
+        `Studio clip config failed: ${lastConfigError}`,
         'warn',
       )
+      if (dialogAttempt >= 2) {
+        throw new Error(`Studio clip config failed: ${lastConfigError}`)
+      }
     }
 
     this.logStep(
       `${label} attached`,
-      `${startStr}–${endStr} @ ${fps} FPS`,
+      `chip #${targetChipIndex} · ${startStr}–${endStr} @ ${fps} FPS (verified)`,
       'success',
     )
   }
@@ -796,9 +1028,9 @@ class StudioBrowserController {
    * Execute a single (shortPart, movieBlock) Studio job:
    * a. Open a NEW chat on aistudio.google.com
    * b. Select model, temperature=0, thinking=High, maxOutputTokens, safety=OFF, mediaRes=Low
-   * c. Attach Video 1 (short part) & Video 2 (movie_360p from Drive), set start/end times + FPS=24
-   * d. Read token counter -> if > 900K, signal caller to shrink movie block and retry
-   * e. Paste prompt and run -> wait up to 15m -> detect quota/error banners with backoff -> policy retry
+   * c. Attach Video 1 (short part) & Video 2 (movie_360p from Drive), set start/end times + FPS=24 (verified read-back)
+   * d. Read token counter -> if > 900K, signal caller to shrink movie block and retry; if implausibly low (~1fps), throw
+   * e. Paste prompt and run -> wait up to 15m -> require Stop hidden + Run enabled + 6s stable answer
    * f. Copy final answer text only (no thoughts) -> calibrate offset mode -> parseChunkMatches
    */
   public async runWindowJob(params: {
@@ -824,6 +1056,7 @@ class StudioBrowserController {
         status: 'success'
         rawText: string
         tokenCount: number
+        isRealTokenCount: boolean
         matches: ChunkMatch[]
         calibratedOffsetMode: 'relative' | 'absolute'
       }
@@ -847,12 +1080,17 @@ class StudioBrowserController {
       onLog,
     } = params
 
-    this.setJobContext(scanId, jobLabel)
+    const scope = { scanId, username }
+    this.setJobContext(scanId, jobLabel, username)
     const page = await this.ensurePage(username)
+
+    const totalVideoSec = Math.max(1, (shortEndSec - shortStartSec) + (movieEndSec - movieStartSec))
+    // At 24 FPS (~1560 tokens/s at Low media resolution), total tokens must be far above a ~1 FPS result (~65-260 tok/s).
+    const minPlausible24FpsTokens = Math.round(totalVideoSec * 500)
 
     const MAX_ATTEMPTS = 3
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-      await this.waitIfPausedOrThrowIfStopped()
+      await this.waitIfPausedOrThrowIfStopped(scope)
 
       try {
         // (a) Open a NEW chat on aistudio.google.com
@@ -871,7 +1109,7 @@ class StudioBrowserController {
         }
 
         // (b) Configure model, temperature 0, thinking High, max output tokens, safety OFF
-        await this.configureRunSettings(page, { modelName, maxOutputTokens })
+        await this.configureRunSettings(page, { modelName, maxOutputTokens }, scope)
 
         // (c) Attach Video 1 = short part & Video 2 = movie_360p from Drive, set start/end & 24 FPS
         await this.attachVideoAndConfigureRange(page, {
@@ -882,6 +1120,7 @@ class StudioBrowserController {
           startSec: shortStartSec,
           endSec: shortEndSec,
           fps: 24,
+          scope,
         })
 
         await this.attachVideoAndConfigureRange(page, {
@@ -891,13 +1130,14 @@ class StudioBrowserController {
           startSec: movieStartSec,
           endSec: movieEndSec,
           fps: 24,
+          scope,
         })
 
         // Wait briefly for AI Studio to finish counting media tokens
-        await new Promise((r) => setTimeout(r, 3000))
+        await new Promise((r) => setTimeout(r, 3500))
 
         // (d) Read Studio's token counter. If > ~900K: shrink the movie block and retry.
-        const tokens = await this.readStudioTokenCount(page)
+        let tokens = await this.readStudioTokenCount(page)
         if (tokens !== null && tokens > 900_000) {
           const msg = `Studio token counter is ${(tokens / 1000).toFixed(0)}K (> 900K limit) for ${jobLabel} — shrinking movie block and retrying`
           this.logStep('shrinking block', msg, 'warn')
@@ -927,25 +1167,55 @@ class StudioBrowserController {
           await promptInput.press('Control+Enter')
         }
 
-        // Wait until generation finishes (Stop button gone / Run enabled) with a 15-min timeout
+        // FIX 1d: Verify after the run starts that the token counter is plausible for 24 FPS (far above ~1 fps)
+        await new Promise((r) => setTimeout(r, 2000))
+        const postStartTokens = await this.readStudioTokenCount(page)
+        if (postStartTokens !== null) {
+          tokens = postStartTokens
+        }
+        if (tokens !== null && tokens > 900_000) {
+          const msg = `Studio token counter is ${(tokens / 1000).toFixed(0)}K (> 900K limit) for ${jobLabel} — shrinking movie block and retrying`
+          this.logStep('shrinking block', msg, 'warn')
+          onLog?.('warn', msg)
+          return { status: 'shrink_needed', tokenCount: tokens }
+        }
+        if (tokens === null || tokens < minPlausible24FpsTokens) {
+          throw new Error(
+            `FPS/range not applied: token counter (${tokens ?? 'missing'}) is implausibly low for ${totalVideoSec.toFixed(0)}s at 24 FPS (expected >= ${minPlausible24FpsTokens})`,
+          )
+        }
+
+        // FIX 3: Poll every 1 s up to 15-min timeout.
+        // Declare answer finished ONLY when ALL are true:
+        // - Stop button is not visible
+        // - Run button is visible and enabled
+        // - Extracted answer text is non-empty and UNCHANGED for 6 consecutive seconds
         const runStarted = Date.now()
         const TIMEOUT_MS = 15 * 60_000
         let rawAnswer = ''
+        let lastCandidateText = ''
+        let stableSeconds = 0
 
         while (Date.now() - runStarted < TIMEOUT_MS) {
-          await this.waitIfPausedOrThrowIfStopped()
+          await this.waitIfPausedOrThrowIfStopped(scope)
           const elapsed = Math.floor((Date.now() - runStarted) / 1000)
           const mm = String(Math.floor(elapsed / 60)).padStart(2, '0')
           const ss = String(elapsed % 60).padStart(2, '0')
           this.logStep(`running ${mm}:${ss}`, jobLabel)
 
-          // Check for error / quota / safety banners
+          // FIX 3b: Stricter error/quota/alert banner detection (real alert/banner containers + specific phrases only)
           const errBannerText = await page.evaluate((sels) => {
+            const strictRegex =
+              /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety)/i
             for (const s of sels) {
-              const el = document.querySelector(s)
-              if (el && (el as HTMLElement).innerText) {
-                const t = (el as HTMLElement).innerText.trim()
-                if (/exhausted|quota|try again|rate limit|error|blocked|prohibited_content|safety/i.test(t)) {
+              const nodes = Array.from(document.querySelectorAll(s))
+              for (const node of nodes) {
+                const el = node as HTMLElement
+                if (!el || !el.innerText) continue
+                const visible = el.offsetParent !== null || el.getClientRects().length > 0
+                if (!visible) continue
+                const t = el.innerText.trim()
+                if (strictRegex.test(t)) {
                   return t
                 }
               }
@@ -954,7 +1224,9 @@ class StudioBrowserController {
           }, [...STUDIO_SELECTORS.errorBanners])
 
           if (errBannerText) {
-            if (/prohibited_content|blocked|safety/i.test(errBannerText) && !sanitized) {
+            this.logStep('error banner', errBannerText.slice(0, 180), 'warn')
+            onLog?.('warn', `Matched AI Studio error banner on ${jobLabel}: "${errBannerText.slice(0, 200)}"`)
+            if (/(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(errBannerText) && !sanitized) {
               onLog?.(
                 'warn',
                 `Studio flagged content policy on ${jobLabel} — retrying once with sanitized neutral prompt`,
@@ -964,34 +1236,44 @@ class StudioBrowserController {
             throw new Error(`AI Studio banner error: ${errBannerText.slice(0, 180)}`)
           }
 
-          // Check if generation finished (after at least 4s of running)
-          if (elapsed >= 4) {
-            const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 300)
-            if (!stopLoc) {
-              const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
-              if (
-                candidateText &&
-                (candidateText.includes('-->') ||
-                  /NOT\s*FOUND/i.test(candidateText) ||
-                  candidateText.length > 40)
-              ) {
+          if (elapsed >= 3) {
+            const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
+            const stopNotVisible = !stopLoc
+
+            const runLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 100)
+            const runVisibleAndEnabled = Boolean(
+              runLoc && (await runLoc.isEnabled().catch(() => false)),
+            )
+
+            const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
+            if (stopNotVisible && runVisibleAndEnabled && candidateText.length > 0) {
+              if (candidateText === lastCandidateText) {
+                stableSeconds += 1
+              } else {
+                lastCandidateText = candidateText
+                stableSeconds = 1
+              }
+
+              if (stableSeconds >= 6) {
                 rawAnswer = candidateText
                 break
               }
+            } else {
+              if (candidateText.length > 0) {
+                lastCandidateText = candidateText
+              }
+              stableSeconds = 0
             }
           }
 
-          await new Promise((r) => setTimeout(r, 1500))
+          await new Promise((r) => setTimeout(r, 1000))
         }
 
         if (!rawAnswer) {
-          rawAnswer = await this.extractFinalAnswerWithoutThoughts(page)
-        }
-        if (!rawAnswer) {
-          throw new Error(`Timed out or empty answer from AI Studio for ${jobLabel}`)
+          throw new Error(`Timed out waiting for stable answer from AI Studio for ${jobLabel}`)
         }
 
-        this.logStep('answer copied', `${rawAnswer.length} chars extracted (thoughts excluded)`, 'success')
+        this.logStep('answer copied', `${rawAnswer.length} chars extracted (6s stable, thoughts excluded)`, 'success')
 
         // (f) & (g) Calibrate offset mode (relative 0:00 vs absolute startSec) and parse via parseChunkMatches!
         const calibrated = await this.calibrateAndParseMatches({
@@ -1005,16 +1287,19 @@ class StudioBrowserController {
           onLog,
         })
 
+        // SMALL COSMETIC: Use real Studio token counter when available, else fallback to 1560 tokens/s (65 tok/frame * 24 fps)
+        const fallbackTokens24Fps = Math.round(totalVideoSec * 1560)
         return {
           status: 'success',
           rawText: rawAnswer,
-          tokenCount: tokens || Math.round(((shortEndSec - shortStartSec) + (movieEndSec - movieStartSec)) * 260),
+          tokenCount: tokens || fallbackTokens24Fps,
+          isRealTokenCount: tokens !== null,
           matches: calibrated.matches,
           calibratedOffsetMode: calibrated.offsetMode,
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        const isPolicy = /prohibited_content|blocked|safety/i.test(msg)
+        const isPolicy = /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
         if (isPolicy && sanitized) {
           throw new Error(`POLICY_BLOCKED: ${msg}`)
         }

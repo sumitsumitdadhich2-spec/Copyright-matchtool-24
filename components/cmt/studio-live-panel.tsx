@@ -54,11 +54,45 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
   const [assistUrl, setAssistUrl] = useState('https://aistudio.google.com/prompts/new_chat')
   const [actionToast, setActionToast] = useState<string | null>(null)
   const [clickMarker, setClickMarker] = useState<{ xPct: number; yPct: number } | null>(null)
+  const [quickCookieOpen, setQuickCookieOpen] = useState(false)
+  const [quickCookieText, setQuickCookieText] = useState('')
   const imgRef = useRef<HTMLImageElement | null>(null)
 
   const isStudioScan = scan?.chunkScanEngine === 'studio'
   const isActiveOrAssist =
     isStudioScan || Boolean(snap?.active || snap?.paused || snap?.assistMode)
+
+  const failedStudioChunksCount =
+    scan?.shortSegments?.reduce(
+      (sum, seg) =>
+        seg.selected === false
+          ? sum
+          : sum + seg.chunks.filter((c) => c.status === 'failed').length,
+      0,
+    ) ?? 0
+
+  const handleRetryFailedWindows = async () => {
+    if (!scan?.id) return
+    setBusyAction('retry_failed_windows')
+    try {
+      const res = await fetch(`/api/scans/${scan.id}/retry-studio-failed`, {
+        method: 'POST',
+      })
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok || data.ok === false) {
+        setActionToast(data.error || 'Failed to retry Studio windows')
+      } else {
+        setActionToast(
+          `Retrying ${data.retriedChunks ?? failedStudioChunksCount} failed Studio chunk(s) (policy_blocked skipped)...`,
+        )
+      }
+    } catch (err) {
+      setActionToast((err as Error).message)
+    } finally {
+      setBusyAction(null)
+      setTimeout(() => setActionToast(null), 5000)
+    }
+  }
 
   useEffect(() => {
     if (!expanded) return
@@ -119,6 +153,12 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
         setActionToast(data.error || 'Action failed')
       } else if (label === 'save_session') {
         setActionToast('Active browser session cookies encrypted & saved to server!')
+      } else if (label === 'save_cookies') {
+        setActionToast(`Saved & encrypted ${data.cookieCount ?? 0} Google cookies on server!`)
+        setQuickCookieText('')
+        setQuickCookieOpen(false)
+      } else if (label === 'run_test_window') {
+        setActionToast('Started 1-Video Studio Chunk Test (10s short + 30s movie @ 24fps)! Watch live viewport below.')
       } else if (label === 'test_login') {
         setActionToast(
           data.loggedIn
@@ -220,6 +260,23 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
         </button>
 
         <div className="flex flex-wrap items-center gap-1.5">
+          {isStudioScan && failedStudioChunksCount > 0 && !snap?.active && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleRetryFailedWindows}
+              disabled={busyAction !== null}
+              className="h-7 px-2.5 text-[11px] gap-1 border-amber-500/40 text-amber-300 hover:bg-amber-500/10"
+              title="Re-plan and run only chunks with status=failed (skips policy_blocked)"
+            >
+              {busyAction === 'retry_failed_windows' ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <RefreshCw className="h-3 w-3" />
+              )}
+              Retry failed windows ({failedStudioChunksCount})
+            </Button>
+          )}
           {snap?.active && !snap?.paused && (
             <Button
               size="sm"
@@ -248,7 +305,7 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
             <Button
               size="sm"
               variant="outline"
-              onClick={() => sendControl({ action: 'stop' }, 'stop')}
+              onClick={() => sendControl({ action: 'stop', scanId: scan?.id }, 'stop')}
               disabled={busyAction !== null}
               className="h-7 px-2.5 text-[11px] gap-1 border-destructive/40 text-destructive hover:bg-destructive/10"
             >
@@ -256,6 +313,33 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
               Stop
             </Button>
           )}
+
+          <Button
+            size="sm"
+            variant={quickCookieOpen ? 'default' : 'outline'}
+            onClick={() => setQuickCookieOpen((v) => !v)}
+            disabled={busyAction !== null}
+            className="h-7 px-2.5 text-[11px] gap-1"
+          >
+            <Save className="h-3 w-3" />
+            Paste Cookies
+          </Button>
+
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={() => sendControl({ action: 'run_test_window' }, 'run_test_window')}
+            disabled={busyAction !== null || Boolean(snap?.active)}
+            className="h-7 px-2.5 text-[11px] gap-1 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
+            title="Generate 10s Short + 30s Movie test clips and run a real Studio window scan"
+          >
+            {busyAction === 'run_test_window' ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <Play className="h-3 w-3" />
+            )}
+            Test 1-Video Chunk
+          </Button>
 
           <Button
             size="sm"
@@ -289,6 +373,50 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
           </Button>
         </div>
       </div>
+
+      {quickCookieOpen && (
+        <div className="border-b border-border bg-secondary/40 px-4 py-3 flex flex-col gap-2">
+          <div className="flex items-center justify-between text-[11px] text-muted-foreground">
+            <span>
+              Paste Google Cookie-Editor JSON array (or Playwright storageState) below — encrypted on server with AES-256-GCM:
+            </span>
+            <button
+              type="button"
+              onClick={() => setQuickCookieOpen(false)}
+              className="text-[10px] hover:text-foreground"
+            >
+              Close
+            </button>
+          </div>
+          <textarea
+            value={quickCookieText}
+            onChange={(e) => setQuickCookieText(e.target.value)}
+            rows={4}
+            placeholder='[{"domain": ".google.com", "name": "SID", "value": "...", ...}]'
+            className="w-full rounded border border-border bg-input p-2 font-mono text-[11px] text-foreground"
+          />
+          <div className="flex items-center justify-end gap-2">
+            <Button
+              size="sm"
+              onClick={() =>
+                sendControl(
+                  { action: 'save_cookies', cookiesJson: quickCookieText },
+                  'save_cookies',
+                )
+              }
+              disabled={busyAction !== null || !quickCookieText.trim()}
+              className="h-7 px-3 text-[11px] gap-1"
+            >
+              {busyAction === 'save_cookies' ? (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              ) : (
+                <Save className="h-3 w-3" />
+              )}
+              Save Encrypted Cookies
+            </Button>
+          </div>
+        </div>
+      )}
 
       {actionToast && (
         <div className="border-b border-border bg-primary/10 px-4 py-1.5 text-[11px] text-foreground flex items-center justify-between">

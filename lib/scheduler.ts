@@ -68,6 +68,7 @@ import { globalChunkScanCoordinator, registerSchedulerChunkChecker } from './chu
 import { loadStudioUserConfig } from './studio-settings'
 import {
   buildStudioScanPlan,
+  clipMatchToShortSegment,
   deriveChunkIndexForMovieTime,
   splitMovieBlockInHalf,
   type StudioScanJobPlan,
@@ -261,6 +262,7 @@ class Scheduler {
     resume: boolean,
     userApiKeys?: string[],
     tlApiKey?: string | null,
+    retryFailedOnly = false,
   ): Promise<{ ok: boolean; error?: string }> {
     if (this.jobs.has(scanId)) return { ok: false, error: 'Scan already running' }
     const scan = getScan(scanId)
@@ -292,11 +294,27 @@ class Scheduler {
       for (const c of seg.chunks) {
         const inRange = chunkOverlapsSegRange(scan, seg, c.index)
         const isPrefilteredOut = Array.isArray(seg.prefilterChunks) && !seg.prefilterChunks.includes(c.index)
-        const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
+        const isGenuinelyFinished =
+          c.status === 'match' ||
+          c.status === 'no_match' ||
+          (engine === 'studio' && c.status === 'policy_blocked')
+
+        if (retryFailedOnly && engine === 'studio') {
+          if (c.status === 'failed' && inRange && !isPrefilteredOut) {
+            c.status = 'pending'
+          }
+          continue
+        }
 
         // Any chunk without genuine result (match / no_match) that is in range must be revived to pending
         if (!isGenuinelyFinished) {
-          if (c.status === 'scanning' || c.status === 'failed' || (c.status as string) === 'done' || (c.status as string) === 'error' || (c.status as string) === 'parked') {
+          if (
+            c.status === 'scanning' ||
+            (c.status === 'failed' && engine !== 'studio') ||
+            (c.status as string) === 'done' ||
+            (c.status as string) === 'error' ||
+            (c.status as string) === 'parked'
+          ) {
             c.status = 'pending'
           }
           // 'cancelled' is ONLY ever set by skip logic (range, pre-filter, or
@@ -320,7 +338,13 @@ class Scheduler {
       if (seg.status === 'scanning' || seg.status === 'verifying') seg.status = 'pending'
       // If ANY chunk in this segment is still pending or not genuinely finished (not match/no_match/cancelled),
       // the segment CANNOT be marked done!
-      const hasUnfinishedChunks = seg.chunks.some((c) => c.status !== 'match' && c.status !== 'no_match' && c.status !== 'cancelled')
+      const hasUnfinishedChunks = seg.chunks.some(
+        (c) =>
+          c.status !== 'match' &&
+          c.status !== 'no_match' &&
+          c.status !== 'cancelled' &&
+          !(engine === 'studio' && (c.status === 'policy_blocked' || (!retryFailedOnly && c.status === 'failed'))),
+      )
       if (hasUnfinishedChunks) {
         seg.status = 'pending'
       }
@@ -497,11 +521,52 @@ class Scheduler {
     return { ok: true }
   }
 
+  /**
+   * Re-plans and runs ONLY chunks with status === 'failed' (never 'policy_blocked')
+   * through runStudioChunkScan for a Gemini Studio scan.
+   */
+  async retryFailedStudioWindows(
+    scanId: string,
+    userApiKeys?: string[],
+    tlApiKey?: string | null,
+  ): Promise<{ ok: boolean; error?: string; retriedChunks?: number }> {
+    if (this.jobs.has(scanId)) return { ok: false, error: 'Scan is currently running' }
+    const scan = getScan(scanId)
+    if (!scan) return { ok: false, error: 'Scan not found' }
+    const studioCfg = await loadStudioUserConfig(scan.ownerUsername || 'admin')
+    scan.chunkScanEngine = scan.chunkScanEngine || studioCfg.chunkScanEngine || 'studio'
+    if (scan.chunkScanEngine !== 'studio') {
+      return { ok: false, error: 'Scan is not configured for Gemini Studio engine' }
+    }
+
+    this.ensureSegments(scan)
+    const segments = scan.shortSegments || []
+    let failedCount = 0
+    for (const seg of segments) {
+      if (seg.selected === false) continue
+      for (const c of seg.chunks) {
+        if (c.status === 'failed') failedCount++
+      }
+    }
+    if (failedCount === 0) {
+      return { ok: false, error: 'No failed Studio chunks to retry (policy_blocked chunks are skipped).' }
+    }
+
+    addLog(
+      scan,
+      'info',
+      `[Studio Retry] Re-planning ${failedCount} failed chunk(s) into Studio windows (policy_blocked chunks stay untouched)...`,
+    )
+    saveScan(scan)
+    const res = await this.start(scanId, true, userApiKeys, tlApiKey, true)
+    return { ...res, retriedChunks: failedCount }
+  }
+
   stop(scanId: string): { ok: boolean; error?: string } {
     globalChunkScanCoordinator.releaseChunkScanLock(scanId, true)
     globalChunkScanCoordinator.removeFromQueue(scanId)
     globalOrchestrator.stop()
-    studioController.requestStop()
+    studioController.requestStop({ scanId })
     const job = this.jobs.get(scanId)
     if (!job) return { ok: false, error: 'Scan is not running' }
     job.stopping = true
@@ -1346,11 +1411,14 @@ class Scheduler {
       const activeSegments = segments.filter((s) => s.selected !== false)
 
       // Revive any chunks that do not have real result (match / no_match) and are not legitimately cancelled
+      // For Studio engine, do NOT auto-revive 'failed' or 'policy_blocked' chunks in pass loops (manual Retry button handles 'failed').
+      const isStudioEngine = scan.chunkScanEngine === 'studio'
       for (const seg of activeSegments) {
         for (const c of seg.chunks) {
           const inRange = chunkOverlapsSegRange(scan, seg, c.index)
           const isPrefilteredOut = Array.isArray(seg.prefilterChunks) && !seg.prefilterChunks.includes(c.index)
-          const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match'
+          const isStudioSettled = isStudioEngine && (c.status === 'failed' || c.status === 'policy_blocked')
+          const isGenuinelyFinished = c.status === 'match' || c.status === 'no_match' || isStudioSettled
           if (!isGenuinelyFinished && inRange && !isPrefilteredOut && !c.skippedEarlyStop) {
             c.status = 'pending'
           }
@@ -1628,151 +1696,273 @@ class Scheduler {
     const { scan } = job
     const owner = scan.ownerUsername || 'admin'
     const studioCfg = await loadStudioUserConfig(owner)
-    studioController.clearStop()
+    const stopScope = { scanId: scan.id, username: owner }
+    studioController.clearStop(stopScope)
 
-    // 1. Ensure movie_360p.mp4 is compressed and uploaded to Drive "CMT"
-    const mediaDir = scanMediaDir(scan.id)
-    const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
-    if (
-      !scan.movie360p ||
-      scan.movie360p.status !== 'ready' ||
-      !fs.existsSync(movie360Path)
-    ) {
-      addLog(scan, 'info', 'Studio engine: ensuring movie_360p.mp4 is compressed and uploaded to Google Drive "CMT"...')
-      this.mark(job)
-      await prepareStudioMovie360pAndDrive(scan.id, undefined, scan.movieDuration || undefined, owner)
-      const refreshed = getScan(scan.id)
-      if (refreshed?.movie360p) {
-        scan.movie360p = refreshed.movie360p
-      }
-    }
-
-    // 2. Ensure short video source (YouTube URL if present, else Drive/local file <= 390 MB)
-    let shortReady: { localPath: string; driveFileId?: string; driveFileName?: string } | null = null
-    if (!scan.shortYoutubeUrl) {
-      shortReady = await ensureStudioShortReady(scan.id, owner)
-    }
-
-    // 3. Build window plan: group short segments into <=3m parts, union approved movieMinutes into <=5m blocks
-    const plannedJobs: StudioScanJobPlan[] = buildStudioScanPlan(scan, targetSegments, {
-      windowMinutes: studioCfg.studioWindowMinutes || 5,
-      shortPartMinutes: studioCfg.studioShortPartMinutes || 3,
-      windowOverlapSec: studioCfg.studioWindowOverlapSec || 0,
-    })
-
-    if (plannedJobs.length === 0) {
-      addLog(scan, 'info', 'Studio Window Planner: 0 pending window blocks to scan.')
-      return
-    }
-
-    addLog(
-      scan,
-      'info',
-      `Studio Window Planner: ${plannedJobs.length} window job(s) planned (short parts <= ${studioCfg.studioShortPartMinutes}m, movie blocks <= ${studioCfg.studioWindowMinutes}m, overlap ${studioCfg.studioWindowOverlapSec}s). Running strictly 1 at a time.`,
+    // FIX 6: Acquire exclusive Studio browser lock across all users (single shared browser)
+    const releaseStudioBrowserLock = await studioController.acquireJobLock(
+      scan.id,
+      owner,
+      (_pos, waitMsg) => {
+        addLog(scan, 'info', waitMsg)
+        this.mark(job)
+      },
     )
-    this.mark(job)
 
-    const queue: StudioScanJobPlan[] = [...plannedJobs]
-    let completedCount = 0
+    try {
+      if (job.stopping || studioController.isStopping(stopScope)) return
 
-    while (queue.length > 0 && !job.stopping && !studioController.isStopping()) {
-      const wJob = queue.shift()!
-      const { shortPart, movieBlock } = wJob
-      const jobLabel = `Job ${completedCount + 1}/${completedCount + queue.length + 1}: ${shortPart.label} × ${movieBlock.label}`
-
-      // Mirror active short segment for UI timeline compatibility
-      const firstSegIdx = shortPart.segmentIndexes[0] ?? 0
-      const activeSeg = targetSegments.find((s) => s.index === firstSegIdx) || targetSegments[0]
-      if (activeSeg) {
-        job.seg = activeSeg
-        scan.currentShortSegment = activeSeg.index
-        scan.chunks = activeSeg.chunks
-        if (activeSeg.status === 'pending') activeSeg.status = 'scanning'
-      }
-
-      // Mark all 60s chunks covered by (shortPart, movieBlock) as 'scanning'
-      const coveredSegs = targetSegments.filter((s) => shortPart.segmentIndexes.includes(s.index))
-      for (const seg of coveredSegs) {
-        for (const ci of movieBlock.chunkIndexes) {
-          const ch = seg.chunks[ci]
-          if (ch && ch.status === 'pending') {
-            ch.status = 'scanning'
-            ch.model = studioCfg.studioModelName
-          }
+      // 1. Ensure movie_360p.mp4 is compressed and uploaded to Drive "CMT"
+      const mediaDir = scanMediaDir(scan.id)
+      const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
+      if (
+        !scan.movie360p ||
+        scan.movie360p.status !== 'ready' ||
+        !fs.existsSync(movie360Path)
+      ) {
+        addLog(scan, 'info', 'Studio engine: ensuring movie_360p.mp4 is compressed and uploaded to Google Drive "CMT"...')
+        this.mark(job)
+        await prepareStudioMovie360pAndDrive(scan.id, undefined, scan.movieDuration || undefined, owner)
+        const refreshed = getScan(scan.id)
+        if (refreshed?.movie360p) {
+          scan.movie360p = refreshed.movie360p
         }
       }
+
+      // 2. Ensure short video source (YouTube URL if present, else Drive/local file <= 390 MB)
+      let shortReady: { localPath: string; driveFileId?: string; driveFileName?: string } | null = null
+      if (!scan.shortYoutubeUrl) {
+        shortReady = await ensureStudioShortReady(scan.id, owner)
+      }
+
+      // 3. Build window plan: group short segments into <=3m parts, union approved movieMinutes into <=5m blocks
+      const plannedJobs: StudioScanJobPlan[] = buildStudioScanPlan(scan, targetSegments, {
+        windowMinutes: studioCfg.studioWindowMinutes || 5,
+        shortPartMinutes: studioCfg.studioShortPartMinutes || 3,
+        windowOverlapSec: studioCfg.studioWindowOverlapSec || 0,
+      })
+
+      if (plannedJobs.length === 0) {
+        addLog(scan, 'info', 'Studio Window Planner: 0 pending window blocks to scan.')
+        return
+      }
+
+      addLog(
+        scan,
+        'info',
+        `Studio Window Planner: ${plannedJobs.length} window job(s) planned (short parts <= ${studioCfg.studioShortPartMinutes}m, movie blocks <= ${studioCfg.studioWindowMinutes}m, overlap ${studioCfg.studioWindowOverlapSec}s). Running strictly 1 at a time.`,
+      )
       this.mark(job)
 
-      try {
-        const res = await studioController.runWindowJob({
-          username: owner,
-          scanId: scan.id,
-          jobLabel,
-          modelName: studioCfg.studioModelName,
-          maxOutputTokens: studioCfg.studioMaxOutputTokens,
-          shortYoutubeUrl: scan.shortYoutubeUrl,
-          shortDriveFileName: shortReady?.driveFileName || scan.shortDriveFileName,
-          shortLocalPath: shortReady?.localPath || path.join(mediaDir, 'short.mp4'),
-          shortStartSec: shortPart.startSec,
-          shortEndSec: shortPart.endSec,
-          movieDriveFileName: scan.movie360p?.driveFileName,
-          movieLocalPath: movie360Path,
-          movieStartSec: movieBlock.startSec,
-          movieEndSec: movieBlock.endSec,
-          onLog: (lvl, msg) => {
-            addLog(scan, lvl, msg)
-            this.mark(job)
-          },
-        })
+      const queue: StudioScanJobPlan[] = [...plannedJobs]
+      let completedCount = 0
+      const MAX_SHRINK_LEVELS = 3
 
-        if (res.status === 'shrink_needed') {
-          // Reset scanning chunks back to pending and split the movieBlock in half
-          for (const seg of coveredSegs) {
-            for (const ci of movieBlock.chunkIndexes) {
-              const ch = seg.chunks[ci]
-              if (ch && ch.status === 'scanning') ch.status = 'pending'
+      while (queue.length > 0 && !job.stopping && !studioController.isStopping(stopScope)) {
+        const wJob = queue.shift()!
+        const { shortPart, movieBlock } = wJob
+        const currentShrinkLevel = wJob.shrinkLevel ?? 0
+        const jobLabel = `Job ${completedCount + 1}/${completedCount + queue.length + 1}: ${shortPart.label} × ${movieBlock.label}`
+
+        // Mirror active short segment for UI timeline compatibility
+        const firstSegIdx = shortPart.segmentIndexes[0] ?? 0
+        const activeSeg = targetSegments.find((s) => s.index === firstSegIdx) || targetSegments[0]
+        if (activeSeg) {
+          job.seg = activeSeg
+          scan.currentShortSegment = activeSeg.index
+          scan.chunks = activeSeg.chunks
+          if (activeSeg.status === 'pending') activeSeg.status = 'scanning'
+        }
+
+        // Mark all 60s chunks covered by (shortPart, movieBlock) as 'scanning'
+        const coveredSegs = targetSegments.filter((s) => shortPart.segmentIndexes.includes(s.index))
+        for (const seg of coveredSegs) {
+          for (const ci of movieBlock.chunkIndexes) {
+            const ch = seg.chunks[ci]
+            if (ch && ch.status === 'pending') {
+              ch.status = 'scanning'
+              ch.model = studioCfg.studioModelName
             }
           }
-          const subBlocks = splitMovieBlockInHalf(scan, movieBlock, studioCfg.studioWindowOverlapSec || 0)
-          if (subBlocks.length > 1) {
-            const subJobs: StudioScanJobPlan[] = subBlocks.map((b, idx) => ({
-              jobIndex: wJob.jobIndex + idx,
-              shortPart,
-              movieBlock: b,
-            }))
-            queue.unshift(...subJobs)
-            addLog(
-              scan,
-              'warn',
-              `Studio token counter (${Math.round(res.tokenCount / 1000)}K > 900K) — split ${movieBlock.label} into ${subBlocks.map((b) => b.label).join(' & ')} and queued for immediate retry.`,
-            )
-            this.mark(job)
-            continue
-          }
         }
+        this.mark(job)
 
-        if (res.status === 'success') {
-          completedCount++
-          const tokenUsage: ChunkTokenUsage = {
-            shortVideoTokens: Math.round(shortPart.durationSec * 260),
-            chunkVideoTokens: Math.round(movieBlock.durationSec * 260),
-            promptTokens: 850,
-            outputTokens: Math.round(res.rawText.length / 4),
-            totalTokens: res.tokenCount,
-            shortDurationSec: Number(shortPart.durationSec.toFixed(1)),
-            chunkDurationSec: Number(movieBlock.durationSec.toFixed(1)),
-            ratePerSec: 260,
-            isGoogleVerified: true,
+        try {
+          const res = await studioController.runWindowJob({
+            username: owner,
+            scanId: scan.id,
+            jobLabel,
+            modelName: studioCfg.studioModelName,
+            maxOutputTokens: studioCfg.studioMaxOutputTokens,
+            shortYoutubeUrl: scan.shortYoutubeUrl,
+            shortDriveFileName: shortReady?.driveFileName || scan.shortDriveFileName,
+            shortLocalPath: shortReady?.localPath || path.join(mediaDir, 'short.mp4'),
+            shortStartSec: shortPart.startSec,
+            shortEndSec: shortPart.endSec,
+            movieDriveFileName: scan.movie360p?.driveFileName,
+            movieLocalPath: movie360Path,
+            movieStartSec: movieBlock.startSec,
+            movieEndSec: movieBlock.endSec,
+            onLog: (lvl, msg) => {
+              addLog(scan, lvl, msg)
+              this.mark(job)
+            },
+          })
+
+          if (res.status === 'shrink_needed') {
+            const subBlocks =
+              currentShrinkLevel < MAX_SHRINK_LEVELS
+                ? splitMovieBlockInHalf(scan, movieBlock, studioCfg.studioWindowOverlapSec || 0)
+                : []
+
+            if (subBlocks.length > 1) {
+              // Reset scanning chunks back to pending and queue the split sub-blocks
+              for (const seg of coveredSegs) {
+                for (const ci of movieBlock.chunkIndexes) {
+                  const ch = seg.chunks[ci]
+                  if (ch && ch.status === 'scanning') ch.status = 'pending'
+                }
+              }
+              const subJobs: StudioScanJobPlan[] = subBlocks.map((b, idx) => ({
+                jobIndex: wJob.jobIndex + idx,
+                shortPart,
+                movieBlock: b,
+                shrinkLevel: currentShrinkLevel + 1,
+              }))
+              queue.unshift(...subJobs)
+              addLog(
+                scan,
+                'warn',
+                `Studio token counter (${Math.round(res.tokenCount / 1000)}K > 900K, shrink level ${currentShrinkLevel + 1}/${MAX_SHRINK_LEVELS}) — split ${movieBlock.label} into ${subBlocks.map((b) => b.label).join(' & ')} and queued for immediate retry.`,
+              )
+              this.mark(job)
+              continue
+            } else {
+              // FIX 4: Shrink dead-end — cannot split further (<=1 block or max shrink depth 3 reached)
+              const deadEndMsg = `token counter too high (${Math.round(res.tokenCount / 1000)}K > 900K) and block cannot be split (shrink level ${currentShrinkLevel}/${MAX_SHRINK_LEVELS})`
+              for (const seg of coveredSegs) {
+                for (const ci of movieBlock.chunkIndexes) {
+                  const ch = seg.chunks[ci]
+                  if (!ch) continue
+                  this.recordChunkOutput(
+                    ch,
+                    studioCfg.studioModelName,
+                    `[GEMINI STUDIO ERROR · ${jobLabel}]\n${deadEndMsg}`,
+                    undefined,
+                    'error',
+                    deadEndMsg,
+                  )
+                  ch.status = 'failed'
+                }
+              }
+              addLog(
+                scan,
+                'error',
+                `${jobLabel}: ${deadEndMsg} — marked chunks [${movieBlock.chunkIndexes.join(', ')}] as failed.`,
+              )
+              this.mark(job)
+              continue
+            }
           }
 
-          // Assign each match its 60s chunkIndex = floor((movieStart - trimStart) / 60)
-          const enrichedMatches: ChunkMatch[] = res.matches.map((m) => ({
-            ...m,
-            chunkIndex: deriveChunkIndexForMovieTime(scan, m.movieStart, movieBlock.chunkIndexes),
-            model: studioCfg.studioModelName,
-          }))
+          if (res.status === 'success') {
+            completedCount++
+            // SMALL COSMETIC: Use real Studio token counter when available, and fallback to 1560 tokens/s (65 tok/frame * 24 fps)
+            const STUDIO_FALLBACK_RATE = 1560
+            const totalVidDur = Math.max(1, shortPart.durationSec + movieBlock.durationSec)
+            const promptTokens = 850
+            const outputTokens = Math.round(res.rawText.length / 4)
+            const videoTokensTotal = res.isRealTokenCount
+              ? Math.max(0, res.tokenCount - promptTokens)
+              : Math.round(totalVidDur * STUDIO_FALLBACK_RATE)
+            const effectiveRatePerSec = res.isRealTokenCount
+              ? Math.max(1, Math.round(videoTokensTotal / totalVidDur))
+              : STUDIO_FALLBACK_RATE
 
-          // Record raw text and update all 60s chunk indexes inside this finished block
+            const tokenUsage: ChunkTokenUsage = {
+              shortVideoTokens: Math.round(videoTokensTotal * (shortPart.durationSec / totalVidDur)),
+              chunkVideoTokens: Math.round(videoTokensTotal * (movieBlock.durationSec / totalVidDur)),
+              promptTokens,
+              outputTokens,
+              totalTokens: res.isRealTokenCount ? res.tokenCount + outputTokens : videoTokensTotal + promptTokens + outputTokens,
+              shortDurationSec: Number(shortPart.durationSec.toFixed(1)),
+              chunkDurationSec: Number(movieBlock.durationSec.toFixed(1)),
+              ratePerSec: effectiveRatePerSec,
+              isGoogleVerified: res.isRealTokenCount,
+            }
+
+            // Assign each match its 60s chunkIndex = floor((movieStart - trimStart) / 60)
+            const enrichedMatches: ChunkMatch[] = res.matches.map((m) => ({
+              ...m,
+              chunkIndex: deriveChunkIndexForMovieTime(scan, m.movieStart, movieBlock.chunkIndexes),
+              model: studioCfg.studioModelName,
+            }))
+
+            // FIX 2: Clip each match to [seg.start, seg.end] and shift movieStart/movieEnd proportionally
+            // before calling mergeMatches for each segment, dropping pieces < 0.05 s.
+            for (const seg of coveredSegs) {
+              const clippedForSeg: ChunkMatch[] = []
+              for (const m of enrichedMatches) {
+                const clipped = clipMatchToShortSegment(
+                  m,
+                  seg.start,
+                  seg.end,
+                  scan,
+                  movieBlock.chunkIndexes,
+                )
+                if (clipped) {
+                  clippedForSeg.push(clipped)
+                }
+              }
+
+              for (const ci of movieBlock.chunkIndexes) {
+                const ch = seg.chunks[ci]
+                if (!ch) continue
+                this.recordChunkOutput(
+                  ch,
+                  studioCfg.studioModelName,
+                  `[GEMINI STUDIO · ${jobLabel} · offset=${res.calibratedOffsetMode}]\n${res.rawText}`,
+                  tokenUsage,
+                  'success',
+                )
+                const segChunkMatches = clippedForSeg.filter((m) => m.chunkIndex === ci)
+                ch.matches = segChunkMatches
+                ch.status = segChunkMatches.length > 0 ? 'match' : 'no_match'
+                this.mergeMatches(scan, ci, segChunkMatches, seg)
+              }
+
+              const hasUnfinished = seg.chunks.some(
+                (item) =>
+                  item.status !== 'match' &&
+                  item.status !== 'no_match' &&
+                  item.status !== 'cancelled' &&
+                  item.status !== 'policy_blocked' &&
+                  item.status !== 'failed',
+              )
+              if (!hasUnfinished && seg.status !== 'done') {
+                seg.status = 'done'
+              }
+            }
+
+            if (enrichedMatches.length > 0) {
+              this.enqueueNewGroups(job)
+              addLog(
+                scan,
+                'success',
+                `${jobLabel}: ${enrichedMatches.length} matched segment(s) found (${Math.round(res.tokenCount / 1000)}K tokens)`,
+              )
+            } else {
+              addLog(
+                scan,
+                'info',
+                `${jobLabel}: no matched segments found in this window (${Math.round(res.tokenCount / 1000)}K tokens)`,
+              )
+            }
+            this.mark(job)
+          }
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err)
+          const isPolicy = msg.startsWith('POLICY_BLOCKED:') || /prohibited_content/i.test(msg)
           for (const seg of coveredSegs) {
             for (const ci of movieBlock.chunkIndexes) {
               const ch = seg.chunks[ci]
@@ -1780,75 +1970,26 @@ class Scheduler {
               this.recordChunkOutput(
                 ch,
                 studioCfg.studioModelName,
-                `[GEMINI STUDIO · ${jobLabel} · offset=${res.calibratedOffsetMode}]\n${res.rawText}`,
-                tokenUsage,
-                'success',
+                `[GEMINI STUDIO ERROR · ${jobLabel}]\n${msg}`,
+                undefined,
+                'error',
+                msg,
               )
-              const segChunkMatches = enrichedMatches.filter(
-                (m) => m.chunkIndex === ci && m.shortStart < seg.end && m.shortEnd > seg.start,
-              )
-              ch.matches = segChunkMatches
-              ch.status = segChunkMatches.length > 0 ? 'match' : 'no_match'
-              this.mergeMatches(scan, ci, segChunkMatches, seg)
-            }
-
-            const hasUnfinished = seg.chunks.some(
-              (item) =>
-                item.status !== 'match' &&
-                item.status !== 'no_match' &&
-                item.status !== 'cancelled' &&
-                item.status !== 'policy_blocked' &&
-                item.status !== 'failed',
-            )
-            if (!hasUnfinished && seg.status !== 'done') {
-              seg.status = 'done'
+              ch.status = isPolicy ? 'policy_blocked' : 'failed'
             }
           }
-
-          if (enrichedMatches.length > 0) {
-            this.enqueueNewGroups(job)
-            addLog(
-              scan,
-              'success',
-              `${jobLabel}: ${enrichedMatches.length} matched segment(s) found (${Math.round(res.tokenCount / 1000)}K tokens)`,
-            )
-          } else {
-            addLog(
-              scan,
-              'info',
-              `${jobLabel}: no matched segments found in this window (${Math.round(res.tokenCount / 1000)}K tokens)`,
-            )
-          }
+          addLog(
+            scan,
+            isPolicy ? 'warn' : 'error',
+            `${jobLabel} failed: ${msg.slice(0, 180)} — marked chunks [${movieBlock.chunkIndexes.join(', ')}] as ${isPolicy ? 'policy_blocked' : 'failed'}`,
+          )
           this.mark(job)
         }
-      } catch (err) {
-        const msg = err instanceof Error ? err.message : String(err)
-        const isPolicy = msg.startsWith('POLICY_BLOCKED:') || /prohibited_content/i.test(msg)
-        for (const seg of coveredSegs) {
-          for (const ci of movieBlock.chunkIndexes) {
-            const ch = seg.chunks[ci]
-            if (!ch) continue
-            this.recordChunkOutput(
-              ch,
-              studioCfg.studioModelName,
-              `[GEMINI STUDIO ERROR · ${jobLabel}]\n${msg}`,
-              undefined,
-              'error',
-              msg,
-            )
-            ch.status = isPolicy ? 'policy_blocked' : 'failed'
-          }
-        }
-        addLog(
-          scan,
-          isPolicy ? 'warn' : 'error',
-          `${jobLabel} failed: ${msg.slice(0, 180)} — marked chunks [${movieBlock.chunkIndexes.join(', ')}] as ${isPolicy ? 'policy_blocked' : 'failed'}`,
-        )
-        this.mark(job)
       }
+    } finally {
+      studioController.setJobContext(null, null)
+      releaseStudioBrowserLock()
     }
-
-    studioController.setJobContext(null, null)
   }
 
   /**
