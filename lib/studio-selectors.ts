@@ -413,6 +413,24 @@ export const STUDIO_SELECTORS = {
     'button.stop-button',
   ],
 
+  /** Thinking / running spinner (rotating circle next to model turn or on Run-Stop button) */
+  runningSpinners: [
+    'ms-chat-turn mat-spinner',
+    'ms-chat-turn mat-progress-spinner',
+    'ms-chat-turn [role="progressbar"]',
+    'ms-thought-chunk mat-spinner',
+    'ms-thought-chunk mat-progress-spinner',
+    'ms-thought-chunk [role="progressbar"]',
+    'ms-run-button mat-spinner',
+    'ms-run-button mat-progress-spinner',
+    'ms-run-button [role="progressbar"]',
+    'button.run-button mat-spinner',
+    'button.run-button mat-progress-spinner',
+    'mat-spinner',
+    'mat-progress-spinner',
+    '.mat-mdc-progress-spinner',
+  ],
+
   /** Strict Error / Quota / Rate Limit / Safety Block alert containers only */
   errorBanners: [
     '[role="alert"]',

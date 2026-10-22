@@ -1031,9 +1031,9 @@ class StudioBrowserController {
   }
 
   /**
-   * Step (b): Configure model name (default 'Gemini 3.8 Flash', excluding TTS),
-   * Thinking level = High, media resolution = Low/Medium, max output tokens,
-   * and safety settings all OFF. Then close the Run Settings panel so the prompt area is unobstructed.
+   * Step (b): Open Run Settings panel -> set Thinking level = High -> read back and verify "High"
+   * (with 2-attempt retry) -> set max output tokens -> close the Run Settings panel.
+   * Model selection and Media Resolution stay at AI Studio defaults (Gemini 3.8 Flash / default mediaRes).
    */
   private async configureRunSettings(
     page: Page,
@@ -1048,309 +1048,7 @@ class StudioBrowserController {
       await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings panel did not open after clicking toggle')
     }
 
-    // 1. Select Model (prefer configured studioModelName, default 'Gemini 3.8 Flash'; never pick TTS)
-    const rawTargetModel = (config.modelName || 'Gemini 3.8 Flash').trim()
-    const targetModel =
-      rawTargetModel === 'Gemini 2.5 Pro' || rawTargetModel === 'Gemini 3.8 Pro'
-        ? 'Gemini 3.8 Flash'
-        : rawTargetModel
-    let verifiedModelText = ''
-    let modelConfigError = ''
-
-    const normalizeModelStr = (s: string) =>
-      s
-        .toLowerCase()
-        .replace(/[-_]+/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim()
-
-    for (let modelAttempt = 1; modelAttempt <= 2; modelAttempt++) {
-      await this.waitIfPausedOrThrowIfStopped(scope)
-      modelConfigError = ''
-
-      await this.ensureRunSettingsPanelOpen(page)
-
-      const currentCardText = await this.readVisibleModelCardText(page)
-      const targetNorm = normalizeModelStr(targetModel)
-      const currentNorm = normalizeModelStr(currentCardText)
-
-      // Check if current model card in Run Settings already matches "Gemini 3.8 Flash" (and is NOT "Gemini 3.8 Flash TTS")
-      if (
-        currentNorm &&
-        !/\btts\b/i.test(currentNorm) &&
-        (currentNorm.includes(targetNorm) ||
-          (targetNorm.includes('3.8 flash') && /3\.8\s*flash/i.test(currentNorm)))
-      ) {
-        verifiedModelText = currentCardText
-        this.logStep('model verified', `Run settings model already set to "${currentCardText}"`, 'info')
-        break
-      }
-
-      // Click the model selector card at the top of the Run Settings panel to open the Model Selection view
-      let clickedTrigger = false
-      const triggerLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 1800)
-      if (triggerLoc) {
-        await triggerLoc.scrollIntoViewIfNeeded().catch(() => {})
-        await triggerLoc.click().catch(() => {})
-        clickedTrigger = true
-      } else {
-        // Fallback: find the visible model card / button inside the Run Settings panel (right side of viewport, never the top toolbar or center welcome text)
-        const markedCard = await page
-          .evaluate(() => {
-            document
-              .querySelectorAll('[data-cmt-model-card]')
-              .forEach((el) => el.removeAttribute('data-cmt-model-card'))
-
-            const isVisible = (el: Element | null): el is HTMLElement => {
-              if (!el) return false
-              const h = el as HTMLElement
-              const r = h.getBoundingClientRect()
-              return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-            }
-
-            const panelRoot =
-              (Array.from(
-                document.querySelectorAll(
-                  'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i])',
-                ),
-              ).find((el) => isVisible(el) && el.getBoundingClientRect().width >= 150) as HTMLElement | undefined) ||
-              null
-
-            const searchRoot = panelRoot || document.body
-            const candidates = Array.from(
-              searchRoot.querySelectorAll(
-                'ms-model-selector, [class*="model-selector" i], [data-test-id*="model" i], button, [role="button"], [role="combobox"], a, div',
-              ),
-            )
-            for (const c of candidates) {
-              const el = c as HTMLElement
-              if (!isVisible(el)) continue
-              const r = el.getBoundingClientRect()
-              if (!panelRoot && r.left < window.innerWidth * 0.45) continue
-              if (r.width < 40 || r.width > 550 || r.height < 20 || r.height > 150) continue
-              const aria = (el.getAttribute('aria-label') || '').toLowerCase()
-              if (
-                aria.includes('view more actions') ||
-                aria.includes('toggle run settings') ||
-                aria.includes('reset settings') ||
-                aria.includes('get sdk') ||
-                aria.includes('get code')
-              ) {
-                continue
-              }
-              const t = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
-              if (/^start\s+building\s+with\b/i.test(t)) continue
-              if (/gemini[\s-]+\d+(\.\d+)?/i.test(t)) {
-                const btn = el.querySelector(
-                  'button:not([aria-label*="View more actions" i]):not([aria-label*="Toggle run settings" i]), [role="button"], [role="combobox"]',
-                ) as HTMLElement | null
-                ;(btn || el).setAttribute('data-cmt-model-card', 'true')
-                return true
-              }
-            }
-            return false
-          })
-          .catch(() => false)
-
-        if (markedCard) {
-          const fallbackCard = page.locator('[data-cmt-model-card="true"]').first()
-          if ((await fallbackCard.count()) > 0) {
-            await fallbackCard.scrollIntoViewIfNeeded().catch(() => {})
-            await fallbackCard.click().catch(() => {})
-            clickedTrigger = true
-          }
-        }
-      }
-
-      await new Promise((r) => setTimeout(r, 500))
-
-      // Inspect options in the opened "Model selection" panel / overlay and click the best match:
-      // 1) "Gemini 3.8 Flash" / "gemini-3.8-flash" (excluding "TTS")
-      // 2) exact/substring match for targetModel (excluding "TTS")
-      // 3) first entry containing "3.8" (excluding "TTS")
-      const pickResult = await page
-        .evaluate((desiredModel) => {
-          const isVisible = (el: Element): el is HTMLElement => {
-            const h = el as HTMLElement
-            const r = h.getBoundingClientRect()
-            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-          }
-
-          const norm = (s: string) =>
-            s
-              .toLowerCase()
-              .replace(/[-_]+/g, ' ')
-              .replace(/\s+/g, ' ')
-              .trim()
-
-          document
-            .querySelectorAll('[data-cmt-picked-model]')
-            .forEach((el) => el.removeAttribute('data-cmt-picked-model'))
-
-          const rawOptions = Array.from(
-            document.querySelectorAll(
-              'mat-option, [role="option"], [role="menuitem"], ms-model-option, .model-option, button, [role="button"], div[class*="option" i], div[class*="item" i], div[class*="card" i], div[class*="model" i], li',
-            ),
-          ).filter((el) => {
-            if (!isVisible(el)) return false
-            const r = el.getBoundingClientRect()
-            // Model selection list is on the right side or in an overlay pane
-            if (r.left < window.innerWidth * 0.35 && !el.closest('.cdk-overlay-pane')) return false
-            if (r.height < 24 || r.height > 180 || r.width < 120 || r.width > 600) return false
-            const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
-            if (/^start\s+building\s+with\b/i.test(t)) return false
-            if (/^model\s+selection/i.test(t)) return false
-            return (
-              t.length > 0 &&
-              t.length < 320 &&
-              (/gemini/i.test(t) || /3\.8/i.test(t) || /2\.5/i.test(t))
-            )
-          })
-
-          // Keep minimal option cards so we don't pick a wrapper div containing multiple models
-          const options = rawOptions.filter(
-            (el) => !rawOptions.some((child) => child !== el && el.contains(child)),
-          )
-
-          if (options.length === 0) {
-            return { foundList: false, pickedText: '', usedFallback: false, available: [] as string[] }
-          }
-
-          const entries = options.map((el) => ({
-            el: el as HTMLElement,
-            text: ((el as HTMLElement).innerText || el.textContent || '').trim().replace(/\s+/g, ' '),
-            normText: norm(((el as HTMLElement).innerText || el.textContent || '').trim()),
-          }))
-
-          const nonTtsEntries = entries.filter((e) => !/\btts\b/i.test(e.normText))
-          const pool = nonTtsEntries.length > 0 ? nonTtsEntries : entries
-
-          const desiredNorm = norm(desiredModel)
-          let chosen = pool.find((e) => e.normText.includes(desiredNorm))
-          let usedFallback = false
-
-          if (!chosen) {
-            usedFallback = true
-            chosen =
-              pool.find((e) => /gemini\s*3\.8\s*flash/i.test(e.normText)) ||
-              pool.find((e) => /3\.8\s*flash/i.test(e.normText)) ||
-              pool.find((e) => /gemini\s*3\.8\s*pro/i.test(e.normText)) ||
-              pool.find((e) => /3\.8\s*pro/i.test(e.normText)) ||
-              pool.find((e) => /3\.8/i.test(e.normText)) ||
-              undefined
-          }
-
-          if (chosen) {
-            chosen.el.setAttribute('data-cmt-picked-model', 'true')
-            return {
-              foundList: true,
-              pickedText: chosen.text,
-              usedFallback,
-              available: entries.map((e) => e.text),
-            }
-          }
-
-          return {
-            foundList: true,
-            pickedText: '',
-            usedFallback: false,
-            available: entries.map((e) => e.text),
-          }
-        }, targetModel)
-        .catch(() => ({ foundList: false, pickedText: '', usedFallback: false, available: [] as string[] }))
-
-      let expectedSubstringAfterPick = targetNorm
-
-      if (pickResult.pickedText) {
-        const pickedLoc = page.locator('[data-cmt-picked-model="true"]').first()
-        if ((await pickedLoc.count()) > 0) {
-          await pickedLoc.scrollIntoViewIfNeeded().catch(() => {})
-          await pickedLoc.click().catch(() => {})
-        }
-        if (pickResult.usedFallback) {
-          this.logStep(
-            'model fallback',
-            `"${targetModel}" not in list; selected "${pickResult.pickedText}"`,
-            'info',
-          )
-          expectedSubstringAfterPick = /3\.8\s*flash/i.test(pickResult.pickedText)
-            ? '3.8 flash'
-            : /3\.8\s*pro/i.test(pickResult.pickedText)
-              ? '3.8 pro'
-              : '3.8'
-        }
-        await new Promise((r) => setTimeout(r, 500))
-        await this.dismissOpenOverlayIfAny(page)
-      } else {
-        if (!clickedTrigger) {
-          await this.dumpRunSettingsPanelDiagnostics(
-            page,
-            `model selector trigger not found (attempt ${modelAttempt}/2)`,
-          )
-        } else {
-          await this.dumpRunSettingsPanelDiagnostics(
-            page,
-            `model option "${targetModel}" (or "3.8") not found in model list (foundList=${pickResult.foundList}, available=${pickResult.available.join(' | ') || 'none'})`,
-          )
-        }
-        await this.dismissOpenOverlayIfAny(page)
-        if (
-          pickResult.foundList &&
-          !pickResult.available.some((a) => normalizeModelStr(a).includes(targetNorm)) &&
-          /3\.8/i.test(currentCardText) &&
-          !/\btts\b/i.test(currentCardText)
-        ) {
-          this.logStep(
-            'model fallback',
-            `"${targetModel}" not in list; keeping visible 3.8 model "${currentCardText}"`,
-            'info',
-          )
-          expectedSubstringAfterPick = '3.8'
-        }
-      }
-
-      // IMPORTANT (from video 00:46 -> 00:50): Clicking a model card in "Model selection" automatically
-      // closes the Run Settings drawer! Re-open Run Settings now so we can read back the model card and set Thinking level.
-      await this.ensureRunSettingsPanelOpen(page)
-
-      // READ BACK the visible model card text from the Run Settings UI
-      const readBackModel = await this.readVisibleModelCardText(page)
-      const readNorm = normalizeModelStr(readBackModel)
-
-      const modelMatched =
-        Boolean(readNorm) &&
-        !/\btts\b/i.test(readNorm) &&
-        (readNorm.includes(expectedSubstringAfterPick) ||
-          (expectedSubstringAfterPick.includes('3.8 flash') && /3\.8\s*flash/i.test(readNorm)) ||
-          (expectedSubstringAfterPick.includes('3.8') && readNorm.includes('3.8') && pickResult.usedFallback))
-
-      if (modelMatched) {
-        verifiedModelText = readBackModel
-        break
-      }
-
-      modelConfigError = `expected "${targetModel}" (or "${expectedSubstringAfterPick}"), read back "${readBackModel || 'empty'}"`
-      this.logStep(`model retry ${modelAttempt}/2`, modelConfigError, 'warn')
-      await this.dumpRunSettingsPanelDiagnostics(page, `model read-back mismatch: ${modelConfigError}`)
-
-      if (modelAttempt >= 2) {
-        throw new Error(`Studio model config failed: ${modelConfigError}`)
-      }
-    }
-
-    // 2. Set Temperature = 0 (only if present; Gemini 3.8 Flash does not have a Temperature slider)
-    try {
-      const tempInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.temperatureInput, 600)
-      if (tempInput) {
-        await tempInput.click({ clickCount: 3 })
-        await tempInput.fill('0')
-        await tempInput.press('Enter')
-      }
-    } catch {
-      /* ignore */
-    }
-
-    // 3. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
+    // 1. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
     let verifiedThinkingText = ''
     let thinkingConfigError = ''
 
@@ -1429,13 +1127,13 @@ class StudioBrowserController {
       }
     }
 
-    // 4. Ensure Advanced Settings is expanded (in Gemini 3.8 Flash it is expanded by default; do not collapse it!)
+    // 2. Ensure Advanced Settings is expanded if needed for Output length (do not collapse if already expanded)
     try {
-      const mediaResAlreadyVisible = await page
-        .evaluate(() => /media\s+resolution|output\s+length/i.test(document.body.innerText || ''))
+      const outputLengthVisible = await page
+        .evaluate(() => /output\s+length/i.test(document.body.innerText || ''))
         .catch(() => false)
 
-      if (!mediaResAlreadyVisible) {
+      if (!outputLengthVisible) {
         const advBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.advancedSettingsToggle, 1000)
         if (advBtn) {
           const expanded = await advBtn.getAttribute('aria-expanded')
@@ -1449,37 +1147,7 @@ class StudioBrowserController {
       /* ignore */
     }
 
-    // 5. Set Media Resolution = Low using row-scoped selector so it never hits Thinking level
-    try {
-      let resSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.mediaResolutionSelect, 1200)
-      if (!resSelect) {
-        const markedRes = await this.markRowDropdownByLabel(page, '^media\\s+resolution$', 'media-resolution')
-        if (markedRes) {
-          resSelect = page.locator('[data-cmt-row-select="media-resolution"]').first()
-        }
-      }
-      if (resSelect && (await resSelect.count()) > 0) {
-        const currResText = ((await resSelect.innerText().catch(() => '')) || '').trim()
-        if (!/\blow\b/i.test(currResText)) {
-          await resSelect.scrollIntoViewIfNeeded().catch(() => {})
-          await resSelect.click()
-          await new Promise((r) => setTimeout(r, 300))
-          const lowOpt = page
-            .locator('mat-option:has-text("Low"), [role="option"]:has-text("Low"), [role="menuitem"]:has-text("Low")')
-            .first()
-          if ((await lowOpt.count()) > 0) {
-            await lowOpt.click()
-          } else {
-            await this.dismissOpenOverlayIfAny(page)
-          }
-          await new Promise((r) => setTimeout(r, 250))
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-
-    // 6. Set Output length (maxOutputTokens) & Safety Settings if needed
+    // 3. Set Output length (maxOutputTokens) if needed
     try {
       const maxOutInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.maxOutputTokensInput, 1200)
       if (maxOutInput) {
@@ -1496,7 +1164,6 @@ class StudioBrowserController {
     }
 
     // Final read-back verification before closing Run Settings panel
-    const finalModelReadBack = (await this.readVisibleModelCardText(page)) || verifiedModelText
     const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
     if (!/\bhigh\b/i.test(finalThinkingReadBack)) {
       await this.dumpRunSettingsPanelDiagnostics(
@@ -1506,12 +1173,12 @@ class StudioBrowserController {
       throw new Error(`Studio thinking level config failed: expected "High", read back "${finalThinkingReadBack || 'empty'}"`)
     }
 
-    // 7. Close the Run Settings panel (video 01:42-01:48) so the prompt box and Run button are uncovered
+    // 4. Close the Run Settings panel so the prompt box and Run button are uncovered
     await this.closeRunSettingsPanel(page)
 
     this.logStep(
       'model set',
-      `model="${finalModelReadBack}" · thinking="${finalThinkingReadBack}" · mediaRes=Low`,
+      'thinking=High · model/mediaRes=default',
       'success',
     )
   }
@@ -2254,6 +1921,8 @@ class StudioBrowserController {
         await page.keyboard.press('Enter').catch(() => {})
       }
       await new Promise((r) => setTimeout(r, 600))
+      // Wait 10 seconds after clicking Save in the Video settings dialog before doing anything else
+      await new Promise((r) => setTimeout(r, 10_000))
 
       if (!lastConfigError) {
         break
@@ -2386,6 +2055,37 @@ class StudioBrowserController {
   }
 
   /**
+   * Check whether the AI Studio "thinking / running" spinner (rotating circle next to the model turn
+   * or on the Run/Stop button) is currently visible.
+   */
+  private async isThinkingOrRunningSpinnerVisible(page: Page): Promise<boolean> {
+    const loc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runningSpinners, 80)
+    if (loc) return true
+    return page
+      .evaluate((sels) => {
+        const isVisible = (el: Element | null): boolean => {
+          if (!el) return false
+          const h = el as HTMLElement
+          const r = h.getBoundingClientRect()
+          if (r.width <= 0 || r.height <= 0) return false
+          const style = window.getComputedStyle(h)
+          return style.visibility !== 'hidden' && style.display !== 'none' && parseFloat(style.opacity || '1') > 0
+        }
+        for (const s of sels) {
+          if (s.includes(':has-text(')) continue
+          try {
+            const nodes = Array.from(document.querySelectorAll(s))
+            if (nodes.some((n) => isVisible(n))) return true
+          } catch {
+            // ignore invalid CSS selector
+          }
+        }
+        return false
+      }, [...STUDIO_SELECTORS.runningSpinners])
+      .catch(() => false)
+  }
+
+  /**
    * Copy ONLY the final model response text from the latest turn,
    * explicitly stripping any thinking / thought blocks (`ms-thought-chunk`, etc.).
    */
@@ -2397,10 +2097,15 @@ class StudioBrowserController {
       ({ turnSels, thoughtSels }) => {
         let turns: Element[] = []
         for (const sel of turnSels) {
-          const found = Array.from(document.querySelectorAll(sel))
-          if (found.length > 0) {
-            turns = found
-            break
+          if (sel.includes(':has-text(')) continue
+          try {
+            const found = Array.from(document.querySelectorAll(sel))
+            if (found.length > 0) {
+              turns = found
+              break
+            }
+          } catch {
+            // ignore invalid CSS selector
           }
         }
         const lastTurn = turns[turns.length - 1]
@@ -2409,8 +2114,27 @@ class StudioBrowserController {
         // Clone the DOM node so we can safely remove all thought/thinking elements before reading innerText
         const clone = lastTurn.cloneNode(true) as HTMLElement
         for (const tSel of thoughtSels) {
-          clone.querySelectorAll(tSel).forEach((el) => el.remove())
+          if (tSel.includes(':has-text(')) continue
+          try {
+            clone.querySelectorAll(tSel).forEach((el) => el.remove())
+          } catch {
+            // ignore invalid CSS selector
+          }
         }
+
+        // Remove thought panels in JS: for every 'mat-expansion-panel, details' inside the cloned last turn,
+        // if its innerText starts with "Thoughts" or "Thinking" (case-insensitive), remove it.
+        try {
+          clone.querySelectorAll('mat-expansion-panel, details').forEach((el) => {
+            const txt = ((el as HTMLElement).innerText || el.textContent || '').trim()
+            if (/^(thoughts|thinking)\b/i.test(txt)) {
+              el.remove()
+            }
+          })
+        } catch {
+          // ignore
+        }
+
         return (clone.innerText || clone.textContent || '').trim()
       },
       {
@@ -2425,13 +2149,14 @@ class StudioBrowserController {
   /**
    * Execute a single (shortPart, movieBlock) Studio job:
    * a. Open a NEW chat on aistudio.google.com
-   * b. Select model, temperature=0, thinking=High, maxOutputTokens, safety=OFF, mediaRes=Low
-   * c. Attach Video 1 (short part) & Video 2 (movie_360p), set start/end times + FPS=24 (verified read-back)
+   * b. Configure Run Settings (thinking=High, maxOutputTokens; model & mediaRes stay default)
+   * c. Attach Video 1 (short part) & Video 2 (movie_360p), set start/end times + FPS=24 (verified read-back + 10s wait after Save)
    * d. Paste prompt text and check token counter BEFORE pressing Run:
    *    - If > maxInputTokens (1_048_576 - maxOutputTokens - 5_000, or user override), signal shrink_needed
    *    - Never run the shrink check after pressing Run (during generation the counter can include output tokens)
    *    - Keep the implausibly low token counter check (minimum 500 tokens/sec of video)
-   * e. Press Run -> wait up to 15m -> require Stop hidden + Run enabled + 6s stable answer
+   *    - Wait 10s after token counter settles before pressing Run
+   * e. Press Run -> wait up to 15m -> check permission denied first (own 5-retry counter) -> require Stop hidden + spinner gone + Run enabled + 6s stable answer
    * f. Copy final answer text only (no thoughts) -> calibrate offset mode -> parseChunkMatches
    * g. Recycle Playwright page in same persistent context after every N finished window jobs (default 5)
    */
@@ -2501,6 +2226,9 @@ class StudioBrowserController {
     const minPlausible24FpsTokens = Math.round(totalVideoSec * 500)
 
     const MAX_ATTEMPTS = 3
+    const MAX_PERMISSION_RETRIES = 5
+    let permissionDeniedRetries = 0
+
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       await this.waitIfPausedOrThrowIfStopped(scope)
       const page = await this.ensurePage(username)
@@ -2521,10 +2249,10 @@ class StudioBrowserController {
           )
         }
 
-        // (b) Configure model, temperature 0, thinking High, max output tokens, safety OFF
+        // (b) Configure thinking High, max output tokens (model and media resolution stay default)
         await this.configureRunSettings(page, { modelName, maxOutputTokens }, scope)
 
-        // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS
+        // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (waits 10s after each Save)
         await this.attachVideoAndConfigureRange(page, {
           label: 'short',
           youtubeUrl: shortYoutubeUrl,
@@ -2627,6 +2355,9 @@ class StudioBrowserController {
           }
         }
 
+        // Wait 10 seconds after the prompt is pasted and the token counter has settled, then press Run
+        await new Promise((r) => setTimeout(r, 10_000))
+
         // (e) Press Run
         const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
         if (runBtn) {
@@ -2635,39 +2366,77 @@ class StudioBrowserController {
           await promptInput.press('Control+Enter')
         }
 
-        // FIX 3: Poll every 1 s up to 15-min timeout.
-        // Declare answer finished ONLY when ALL are true:
-        // - Stop button is not visible
-        // - Run button is visible and enabled
-        // - Extracted answer text is non-empty and UNCHANGED for 6 consecutive seconds
+        // Poll every 1 s up to 15-min timeout.
+        // 1) Check permission denied FIRST (highest priority).
+        // 2) Job is "alive" if Stop button is visible OR thinking/running spinner is visible.
+        // 3) Job is finished only when: Stop button is hidden AND spinner is gone AND Run button is enabled
+        //    AND extracted answer is non-empty and unchanged for 6 consecutive seconds.
         const runStarted = Date.now()
         const TIMEOUT_MS = 15 * 60_000
         let rawAnswer = ''
         let lastCandidateText = ''
         let stableSeconds = 0
+        let permissionDeniedTriggered = false
 
         while (Date.now() - runStarted < TIMEOUT_MS) {
           await this.waitIfPausedOrThrowIfStopped(scope)
+
+          // Priority 1: Check page text for permission denied as soon as Run is pressed and throughout the run
+          const hasPermissionDenied = await page
+            .evaluate(() => {
+              const bodyText = document.body?.innerText || ''
+              return /failed to generate content[\s\S]{0,80}permission denied|caller does not have permission/i.test(
+                bodyText,
+              )
+            })
+            .catch(() => false)
+
+          if (hasPermissionDenied) {
+            permissionDeniedRetries += 1
+            this.logStep(
+              'permission denied - retrying',
+              `${jobLabel} (permission retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES})`,
+              'warn',
+            )
+            onLog?.(
+              'warn',
+              `AI Studio permission denied on ${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 5s and retrying in a new chat`,
+            )
+            if (permissionDeniedRetries > MAX_PERMISSION_RETRIES) {
+              throw new Error(
+                `PERMISSION_DENIED_EXHAUSTED: AI Studio failed to generate content (permission denied / caller does not have permission) after ${MAX_PERMISSION_RETRIES} permission retries on ${jobLabel}`,
+              )
+            }
+            await new Promise((r) => setTimeout(r, 5000))
+            permissionDeniedTriggered = true
+            break
+          }
+
           const elapsed = Math.floor((Date.now() - runStarted) / 1000)
           const mm = String(Math.floor(elapsed / 60)).padStart(2, '0')
           const ss = String(elapsed % 60).padStart(2, '0')
           this.logStep(`running ${mm}:${ss}`, jobLabel)
 
-          // FIX 3b: Stricter error/quota/alert banner detection (real alert/banner containers + specific phrases only)
+          // Stricter error/quota/alert banner detection (real alert/banner containers + specific phrases only)
           const errBannerText = await page.evaluate((sels) => {
             const strictRegex =
               /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety)/i
             for (const s of sels) {
-              const nodes = Array.from(document.querySelectorAll(s))
-              for (const node of nodes) {
-                const el = node as HTMLElement
-                if (!el || !el.innerText) continue
-                const visible = el.offsetParent !== null || el.getClientRects().length > 0
-                if (!visible) continue
-                const t = el.innerText.trim()
-                if (strictRegex.test(t)) {
-                  return t
+              if (s.includes(':has-text(')) continue
+              try {
+                const nodes = Array.from(document.querySelectorAll(s))
+                for (const node of nodes) {
+                  const el = node as HTMLElement
+                  if (!el || !el.innerText) continue
+                  const visible = el.offsetParent !== null || el.getClientRects().length > 0
+                  if (!visible) continue
+                  const t = el.innerText.trim()
+                  if (strictRegex.test(t)) {
+                    return t
+                  }
                 }
+              } catch {
+                // ignore invalid selector
               }
             }
             return null
@@ -2688,35 +2457,47 @@ class StudioBrowserController {
 
           if (elapsed >= 3) {
             const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
-            const stopNotVisible = !stopLoc
+            const stopVisible = Boolean(stopLoc)
+            const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
 
-            const runLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 100)
-            const runVisibleAndEnabled = Boolean(
-              runLoc && (await runLoc.isEnabled().catch(() => false)),
-            )
-
-            const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
-            if (stopNotVisible && runVisibleAndEnabled && candidateText.length > 0) {
-              if (candidateText === lastCandidateText) {
-                stableSeconds += 1
-              } else {
-                lastCandidateText = candidateText
-                stableSeconds = 1
-              }
-
-              if (stableSeconds >= 6) {
-                rawAnswer = candidateText
-                break
-              }
-            } else {
-              if (candidateText.length > 0) {
-                lastCandidateText = candidateText
-              }
+            // Job is alive if EITHER Stop button is visible OR thinking/running spinner is visible
+            if (stopVisible || spinnerVisible) {
               stableSeconds = 0
+            } else {
+              const runLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 100)
+              const runVisibleAndEnabled = Boolean(
+                runLoc && (await runLoc.isEnabled().catch(() => false)),
+              )
+
+              const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
+              if (runVisibleAndEnabled && candidateText.length > 0) {
+                if (candidateText === lastCandidateText) {
+                  stableSeconds += 1
+                } else {
+                  lastCandidateText = candidateText
+                  stableSeconds = 1
+                }
+
+                if (stableSeconds >= 6) {
+                  rawAnswer = candidateText
+                  break
+                }
+              } else {
+                if (candidateText.length > 0) {
+                  lastCandidateText = candidateText
+                }
+                stableSeconds = 0
+              }
             }
           }
 
           await new Promise((r) => setTimeout(r, 1000))
+        }
+
+        if (permissionDeniedTriggered) {
+          // Do NOT consume normal MAX_ATTEMPTS = 3; open a new chat at the top of the loop and redo the same job
+          attempt -= 1
+          continue
         }
 
         if (!rawAnswer) {
@@ -2757,6 +2538,14 @@ class StudioBrowserController {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
+        if (msg.includes('PERMISSION_DENIED_EXHAUSTED:')) {
+          await this.recordFinishedWindowJobAndMaybeRecyclePage(
+            username,
+            effectiveRecycleInterval,
+            onLog,
+          )
+          throw err
+        }
         const isPolicy = /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
         if (isPolicy && sanitized) {
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
