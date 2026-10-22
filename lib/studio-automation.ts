@@ -1233,16 +1233,57 @@ class StudioBrowserController {
         await promptInput.click()
         await promptInput.fill(promptText)
 
-        // Wait for AI Studio to finish counting tokens for both attached videos + pasted prompt text
+        // Wait up to 60 s for AI Studio to finish counting tokens for both attached videos + pasted prompt text:
+        // poll every 1 s, log each reading in the step log, and accept the value only when
+        // it is >= minPlausible24FpsTokens AND unchanged for 3 consecutive reads (counter settled).
         let tokens: number | null = null
-        const tokenWaitDeadline = Date.now() + 8_000
+        let settledTokens: number | null = null
+        let lastReadTokens: number | null = null
+        let consecutiveSameReads = 0
+        let pollCount = 0
+        const tokenWaitDeadline = Date.now() + 60_000
+
         while (Date.now() < tokenWaitDeadline) {
-          await new Promise((r) => setTimeout(r, 700))
+          await new Promise((r) => setTimeout(r, 1000))
+          pollCount += 1
           const readVal = await this.readStudioTokenCount(page)
           if (readVal !== null) {
             tokens = readVal
-            if (tokens >= minPlausible24FpsTokens) break
+            if (readVal >= minPlausible24FpsTokens) {
+              if (readVal === lastReadTokens) {
+                consecutiveSameReads += 1
+              } else {
+                lastReadTokens = readVal
+                consecutiveSameReads = 1
+              }
+            } else {
+              lastReadTokens = readVal
+              consecutiveSameReads = 0
+            }
+            this.logStep(
+              `token poll ${pollCount}s`,
+              `${readVal.toLocaleString()} tokens (min ${minPlausible24FpsTokens.toLocaleString()}, settled ${consecutiveSameReads}/3)`,
+            )
+            if (readVal >= minPlausible24FpsTokens && consecutiveSameReads >= 3) {
+              settledTokens = readVal
+              tokens = settledTokens
+              break
+            }
+          } else {
+            lastReadTokens = null
+            consecutiveSameReads = 0
+            this.logStep(`token poll ${pollCount}s`, 'null (counter not readable)')
           }
+        }
+
+        if (tokens === null) {
+          const warnMsg = `Token counter was never readable (null) after 60s for ${jobLabel} — continuing with fallback estimate`
+          this.logStep('token counter warning', warnMsg, 'warn')
+          onLog?.('warn', warnMsg)
+        } else if (settledTokens === null) {
+          throw new Error(
+            `FPS/range not applied: token counter (${tokens}) is implausibly low for ${totalVideoSec.toFixed(0)}s at 24 FPS (expected >= ${minPlausible24FpsTokens})`,
+          )
         }
 
         // Item 1 & Item 2: Do the token-limit shrink check BEFORE pressing Run
@@ -1259,34 +1300,12 @@ class StudioBrowserController {
           }
         }
 
-        // Item 3: Check implausibly low token counter (minimum 500 tokens/sec of video) before pressing Run if readable
-        if (tokens !== null && tokens < minPlausible24FpsTokens) {
-          throw new Error(
-            `FPS/range not applied: token counter (${tokens}) is implausibly low for ${totalVideoSec.toFixed(0)}s at 24 FPS (expected >= ${minPlausible24FpsTokens})`,
-          )
-        }
-
         // (e) Press Run
         const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
         if (runBtn) {
           await runBtn.click()
         } else {
           await promptInput.press('Control+Enter')
-        }
-
-        // If the token counter was not yet readable before Run, read once right after Run starts
-        // strictly for the implausibly-low check (NEVER for the shrink check).
-        if (tokens === null) {
-          await new Promise((r) => setTimeout(r, 2000))
-          const postStartTokens = await this.readStudioTokenCount(page)
-          if (postStartTokens !== null) {
-            tokens = postStartTokens
-          }
-        }
-        if (tokens === null || tokens < minPlausible24FpsTokens) {
-          throw new Error(
-            `FPS/range not applied: token counter (${tokens ?? 'missing'}) is implausibly low for ${totalVideoSec.toFixed(0)}s at 24 FPS (expected >= ${minPlausible24FpsTokens})`,
-          )
         }
 
         // FIX 3: Poll every 1 s up to 15-min timeout.
