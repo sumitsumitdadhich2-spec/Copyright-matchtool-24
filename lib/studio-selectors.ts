@@ -413,7 +413,7 @@ export const STUDIO_SELECTORS = {
     'button.stop-button',
   ],
 
-  /** Thinking / running spinner (rotating circle next to model turn or on Run-Stop button) */
+  /** Thinking / running spinner (strictly scoped to model turn or Run-Stop button, no page-wide generic mat-spinner) */
   runningSpinners: [
     'ms-chat-turn mat-spinner',
     'ms-chat-turn mat-progress-spinner',
@@ -426,9 +426,37 @@ export const STUDIO_SELECTORS = {
     'ms-run-button [role="progressbar"]',
     'button.run-button mat-spinner',
     'button.run-button mat-progress-spinner',
-    'mat-spinner',
-    'mat-progress-spinner',
-    '.mat-mdc-progress-spinner',
+  ],
+
+  /** Three-dot / more_vert options button INSIDE the last model turn */
+  turnOptionsButton: [
+    'button:has(mat-icon:text("more_vert"))',
+    'button:has(.material-symbols-outlined:text("more_vert"))',
+    'button[aria-label*="Turn options" i]',
+    'button[aria-label*="More options" i]',
+    'button[aria-label*="options" i]',
+    'button[aria-label*="more" i]',
+    'button:has-text("more_vert")',
+  ],
+
+  /** "Copy as text" item inside the CDK overlay menu opened from the turn options button */
+  copyAsTextMenuItem: [
+    '.cdk-overlay-container [role="menuitem"]:has-text("Copy as text")',
+    '.cdk-overlay-container button:has-text("Copy as text")',
+    '.cdk-overlay-container .mat-mdc-menu-item:has-text("Copy as text")',
+    '[role="menu"] [role="menuitem"]:has-text("Copy as text")',
+    '[role="menuitem"]:has-text("Copy as text")',
+  ],
+
+  /** Top page header three-dot buttons that MUST NEVER be clicked when copying a turn */
+  headerMoreButtonToExclude: [
+    'header button[aria-label*="more" i]',
+    'mat-toolbar button[aria-label*="more" i]',
+    'ms-toolbar button[aria-label*="more" i]',
+    '.toolbar button[aria-label*="more" i]',
+    'header button:has-text("more_vert")',
+    'mat-toolbar button:has-text("more_vert")',
+    'ms-header button',
   ],
 
   /** Strict Error / Quota / Rate Limit / Safety Block alert containers only */
@@ -446,6 +474,7 @@ export const STUDIO_SELECTORS = {
     'ms-chat-turn:has(.model-prompt-container)',
     '[data-turn-role="model"]',
     '.model-turn',
+    'ms-chat-turn',
   ],
 
   /** Thinking / Thought containers inside a model turn (MUST BE EXCLUDED when copying final answer) */

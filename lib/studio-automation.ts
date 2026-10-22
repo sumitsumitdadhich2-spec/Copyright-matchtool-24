@@ -238,6 +238,11 @@ class StudioBrowserController {
 
   public async ensurePage(username: string, forceReloadCookies = false): Promise<Page> {
     if (this.page && !this.page.isClosed() && this.context) {
+      await this.context
+        .grantPermissions(['clipboard-read', 'clipboard-write'], {
+          origin: 'https://aistudio.google.com',
+        })
+        .catch(() => {})
       if (forceReloadCookies || this.lastInjectedCookieUser !== username) {
         await this.injectUserCookies(username)
       }
@@ -275,6 +280,12 @@ class StudioBrowserController {
             '--window-size=1366,840',
           ],
         })
+
+        await this.context
+          .grantPermissions(['clipboard-read', 'clipboard-write'], {
+            origin: 'https://aistudio.google.com',
+          })
+          .catch(() => {})
 
         const pages = this.context.pages()
         this.page = pages.length > 0 ? pages[0] : await this.context.newPage()
@@ -339,6 +350,11 @@ class StudioBrowserController {
     if (!this.context) return
 
     try {
+      await this.context
+        .grantPermissions(['clipboard-read', 'clipboard-write'], {
+          origin: 'https://aistudio.google.com',
+        })
+        .catch(() => {})
       const oldPage = this.page
       const freshPage = await this.context.newPage()
       await freshPage.setViewportSize(VIEWPORT)
@@ -2070,14 +2086,13 @@ class StudioBrowserController {
   }
 
   /**
-   * Check whether the AI Studio "thinking / running" spinner (rotating circle next to the model turn
-   * or on the Run/Stop button) is currently visible.
+   * Check whether the AI Studio "thinking / running" spinner is currently visible,
+   * strictly scoped to ONLY the last model turn OR the Run/Stop button (never page-wide generic spinners).
    */
   private async isThinkingOrRunningSpinnerVisible(page: Page): Promise<boolean> {
-    const loc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runningSpinners, 80)
-    if (loc) return true
+    const turnSelectors = STUDIO_SELECTORS.modelTurnContainers
     return page
-      .evaluate((sels) => {
+      .evaluate((turnSels) => {
         const isVisible = (el: Element | null): boolean => {
           if (!el) return false
           const h = el as HTMLElement
@@ -2086,17 +2101,38 @@ class StudioBrowserController {
           const style = window.getComputedStyle(h)
           return style.visibility !== 'hidden' && style.display !== 'none' && parseFloat(style.opacity || '1') > 0
         }
-        for (const s of sels) {
-          if (s.includes(':has-text(')) continue
+
+        const spinnerQuery = 'mat-spinner, mat-progress-spinner, .mat-mdc-progress-spinner, [role="progressbar"]'
+
+        // 1. Check inside the LAST model turn only
+        let turns: Element[] = []
+        for (const sel of turnSels) {
+          if (sel.includes(':has-text(')) continue
           try {
-            const nodes = Array.from(document.querySelectorAll(s))
-            if (nodes.some((n) => isVisible(n))) return true
+            const found = Array.from(document.querySelectorAll(sel))
+            if (found.length > 0) {
+              turns = found
+              break
+            }
           } catch {
-            // ignore invalid CSS selector
+            // ignore
           }
         }
+        const lastTurn = turns[turns.length - 1]
+        if (lastTurn) {
+          const turnSpinners = Array.from(lastTurn.querySelectorAll(spinnerQuery))
+          if (turnSpinners.some((s) => isVisible(s))) return true
+        }
+
+        // 2. Check inside ms-run-button / button.run-button only
+        const runContainers = Array.from(document.querySelectorAll('ms-run-button, button.run-button'))
+        for (const rc of runContainers) {
+          const runSpinners = Array.from(rc.querySelectorAll(spinnerQuery))
+          if (runSpinners.some((s) => isVisible(s))) return true
+        }
+
         return false
-      }, [...STUDIO_SELECTORS.runningSpinners])
+      }, [...turnSelectors])
       .catch(() => false)
   }
 
@@ -2162,6 +2198,266 @@ class StudioBrowserController {
   }
 
   /**
+   * CHANGE 3: Fetch the final answer via the AI Studio UI ("Copy as text" on the last model turn's
+   * three-dot options menu -> clipboard with sentinel guard), falling back to coordinate ratios
+   * and finally to DOM extraction (`extractFinalAnswerWithoutThoughts`).
+   * Total time cap: ~15 seconds.
+   */
+  private async fetchStudioResultFromTurnOrFallback(
+    page: Page,
+  ): Promise<{ text: string; source: 'clipboard' | 'dom' }> {
+    const fetchDeadline = Date.now() + 15_000
+
+    if (this.context) {
+      await this.context
+        .grantPermissions(['clipboard-read', 'clipboard-write'], {
+          origin: 'https://aistudio.google.com',
+        })
+        .catch(() => {})
+    }
+
+    const writeSentinel = async (): Promise<string> => {
+      const sentinel = `__CMT_SENTINEL_${Date.now()}_${Math.random().toString(36).slice(2, 7)}__`
+      await page
+        .evaluate(async (s) => {
+          try {
+            await navigator.clipboard.writeText(s)
+          } catch {
+            // ignore
+          }
+        }, sentinel)
+        .catch(() => {})
+      return sentinel
+    }
+
+    const readClipboardUntilChanged = async (sentinel: string, maxWaitMs = 3000): Promise<string | null> => {
+      const waitEnd = Math.min(fetchDeadline, Date.now() + maxWaitMs)
+      while (Date.now() < waitEnd) {
+        const txt = await page
+          .evaluate(async () => {
+            try {
+              return await navigator.clipboard.readText()
+            } catch {
+              return ''
+            }
+          })
+          .catch(() => '')
+        if (txt && txt !== sentinel && !txt.startsWith('__CMT_SENTINEL_')) {
+          return txt.trim()
+        }
+        await new Promise((r) => setTimeout(r, 100))
+      }
+      return null
+    }
+
+    const clickCopyAsTextInOpenMenu = async (): Promise<string | null> => {
+      for (const itemSel of STUDIO_SELECTORS.copyAsTextMenuItem) {
+        try {
+          const itemLoc = page.locator(itemSel).first()
+          if ((await itemLoc.count()) > 0 && (await itemLoc.isVisible().catch(() => false))) {
+            const itemText = ((await itemLoc.innerText().catch(() => '')) || '').trim()
+            // Strict safety: ONLY click "Copy as text", never "Copy as markdown", "Delete", or "Branch from here"
+            if (/copy\s+as\s+text/i.test(itemText) && !/markdown|delete|branch/i.test(itemText)) {
+              const sentinel = await writeSentinel()
+              await itemLoc.click({ timeout: 1500 })
+              const copied = await readClipboardUntilChanged(sentinel, 3000)
+              if (copied) return copied
+            }
+          }
+        } catch {
+          // try next selector
+        }
+      }
+      return null
+    }
+
+    // Find the last model turn Locator
+    let lastTurnLoc: ReturnType<Page['locator']> | null = null
+    for (const tSel of STUDIO_SELECTORS.modelTurnContainers) {
+      try {
+        const allTurns = page.locator(tSel)
+        const cnt = await allTurns.count()
+        if (cnt > 0) {
+          lastTurnLoc = allTurns.nth(cnt - 1)
+          break
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    // Fallback (a): UI flow using DOM locators scoped strictly inside lastTurn (max 3 tries)
+    if (lastTurnLoc) {
+      for (let copyTry = 1; copyTry <= 3 && Date.now() < fetchDeadline; copyTry++) {
+        try {
+          await lastTurnLoc.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {})
+          const turnBox = await lastTurnLoc.boundingBox().catch(() => null)
+          if (turnBox && turnBox.width > 40 && turnBox.height > 20) {
+            // Click near the center of the last model turn to reveal its turn options toolbar
+            const clickX = Math.round(turnBox.x + turnBox.width * 0.5)
+            const clickY = Math.round(
+              Math.max(85, Math.min(VIEWPORT.height - 60, turnBox.y + Math.min(turnBox.height * 0.5, 220))),
+            )
+            await page.mouse.click(clickX, clickY)
+          } else {
+            await lastTurnLoc.hover({ timeout: 1500 }).catch(() => {})
+          }
+          await new Promise((r) => setTimeout(r, 250))
+
+          // Find the three-dot (more_vert) button strictly inside lastTurnLoc and below the page header
+          let clickedMoreBtn = false
+          for (const btnSel of STUDIO_SELECTORS.turnOptionsButton) {
+            const candidates = lastTurnLoc.locator(btnSel)
+            const cCount = await candidates.count().catch(() => 0)
+            for (let i = 0; i < cCount; i++) {
+              const btn = candidates.nth(i)
+              if (!(await btn.isVisible().catch(() => false))) continue
+              const box = await btn.boundingBox().catch(() => null)
+              // Must be below the top page header bar (y > 68)
+              if (!box || box.y <= 68) continue
+
+              const isInsideTurnAndNotHeader = await btn
+                .evaluate((el) => {
+                  if (el.closest('header, mat-toolbar, ms-toolbar, ms-header, .toolbar')) return false
+                  return Boolean(el.closest('ms-chat-turn, [data-turn-role="model"], .model-turn'))
+                })
+                .catch(() => false)
+
+              if (!isInsideTurnAndNotHeader) continue
+
+              await btn.click({ timeout: 1500 })
+              clickedMoreBtn = true
+              break
+            }
+            if (clickedMoreBtn) break
+          }
+
+          if (clickedMoreBtn) {
+            await new Promise((r) => setTimeout(r, 300))
+            const copied = await clickCopyAsTextInOpenMenu()
+            if (copied) {
+              return { text: copied, source: 'clipboard' }
+            }
+            // Wrong menu opened or "Copy as text" not found — press Escape and retry
+            await page.keyboard.press('Escape').catch(() => {})
+            await new Promise((r) => setTimeout(r, 200))
+          }
+        } catch {
+          await page.keyboard.press('Escape').catch(() => {})
+        }
+      }
+    }
+
+    // Fallback (b): Coordinate ratios on VIEWPORT (1366x840)
+    // 1. Turn center: (0.586, 0.506) -> (800, 425)
+    // 2. Turn three-dot: (0.742, 0.113) -> (1014, 95)
+    // 3. "Copy as text" item: overlay locator first, or coordinate (0.792, 0.227) -> (1082, 191) if verified safe
+    if (Date.now() < fetchDeadline) {
+      try {
+        if (lastTurnLoc) {
+          await lastTurnLoc.scrollIntoViewIfNeeded({ timeout: 1500 }).catch(() => {})
+        }
+        const turnClickX = Math.round(0.586 * VIEWPORT.width)
+        const turnClickY = Math.round(0.506 * VIEWPORT.height)
+        await page.mouse.click(turnClickX, turnClickY)
+        await new Promise((r) => setTimeout(r, 250))
+
+        const moreX = Math.round(0.742 * VIEWPORT.width)
+        const moreY = Math.round(0.113 * VIEWPORT.height)
+        // Verify element at (moreX, moreY) is not a top header bar button before clicking
+        const safeToClickMoreAtCoord = await page
+          .evaluate(
+            ({ x, y }) => {
+              const el = document.elementFromPoint(x, y)
+              if (!el) return false
+              if (el.closest('header, mat-toolbar, ms-toolbar, ms-header')) return false
+              return true
+            },
+            { x: moreX, y: moreY },
+          )
+          .catch(() => false)
+
+        if (safeToClickMoreAtCoord) {
+          await page.mouse.click(moreX, moreY)
+          await new Promise((r) => setTimeout(r, 300))
+
+          // First try clicking the "Copy as text" item in the opened overlay via locator
+          const copiedViaOverlay = await clickCopyAsTextInOpenMenu()
+          if (copiedViaOverlay) {
+            return { text: copiedViaOverlay, source: 'clipboard' }
+          }
+
+          // Otherwise check if (0.792, 0.227) points to "Copy as text"
+          const copyX = Math.round(0.792 * VIEWPORT.width)
+          const copyY = Math.round(0.227 * VIEWPORT.height)
+          const isCopyAsTextAtCoord = await page
+            .evaluate(
+              ({ x, y }) => {
+                const el = document.elementFromPoint(x, y) as HTMLElement | null
+                if (!el) return false
+                const item = (el.closest('[role="menuitem"], button, .mat-mdc-menu-item') || el) as HTMLElement
+                const txt = (item.innerText || item.textContent || '').trim()
+                return /copy\s+as\s+text/i.test(txt) && !/markdown|delete|branch/i.test(txt)
+              },
+              { x: copyX, y: copyY },
+            )
+            .catch(() => false)
+
+          if (isCopyAsTextAtCoord) {
+            const sentinel = await writeSentinel()
+            await page.mouse.click(copyX, copyY)
+            const copied = await readClipboardUntilChanged(sentinel, 3000)
+            if (copied) {
+              return { text: copied, source: 'clipboard' }
+            }
+          }
+          await page.keyboard.press('Escape').catch(() => {})
+        }
+      } catch {
+        await page.keyboard.press('Escape').catch(() => {})
+      }
+    }
+
+    // Debug dump of buttons inside the last turn so selectors can be tuned if UI copy failed
+    try {
+      const turnButtonsDump = await page.evaluate((turnSels) => {
+        let turns: Element[] = []
+        for (const sel of turnSels) {
+          if (sel.includes(':has-text(')) continue
+          try {
+            const found = Array.from(document.querySelectorAll(sel))
+            if (found.length > 0) {
+              turns = found
+              break
+            }
+          } catch {
+            // ignore
+          }
+        }
+        const lastTurn = turns[turns.length - 1]
+        if (!lastTurn) return 'no lastTurn found'
+        const btns = Array.from(lastTurn.querySelectorAll('button, [role="button"]')).slice(0, 12)
+        return btns
+          .map((b) => {
+            const h = b as HTMLElement
+            const r = h.getBoundingClientRect()
+            const aria = h.getAttribute('aria-label') || ''
+            const txt = (h.innerText || h.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 30)
+            return `[aria="${aria}" txt="${txt}" @${Math.round(r.x)},${Math.round(r.y)}]`
+          })
+          .join(' ')
+      }, [...STUDIO_SELECTORS.modelTurnContainers])
+      this.logStep('turn copy fallback->dom', turnButtonsDump.slice(0, 260), 'warn')
+    } catch {
+      // ignore dump error
+    }
+
+    // Fallback (c): DOM extraction without thoughts
+    const domText = await this.extractFinalAnswerWithoutThoughts(page)
+    return { text: domText, source: 'dom' }
+  }
+
+  /**
    * Execute a single (shortPart, movieBlock) Studio job:
    * a. Open a NEW chat on aistudio.google.com
    * b. Configure Run Settings (thinking=High, maxOutputTokens; model & mediaRes stay default)
@@ -2171,8 +2467,8 @@ class StudioBrowserController {
    *    - Never run the shrink check after pressing Run (during generation the counter can include output tokens)
    *    - Keep the implausibly low token counter check (minimum 500 tokens/sec of video)
    *    - Wait 10s after token counter settles before pressing Run
-   * e. Press Run -> wait up to 15m -> check permission denied first (own 5-retry counter) -> require Stop hidden + spinner gone + Run enabled + 6s stable answer
-   * f. Copy final answer text only (no thoughts) -> calibrate offset mode -> parseChunkMatches
+   * e. Press Run -> wait up to 10m -> check permission denied first (own 5-retry counter) -> detect completion via STOP_GONE | HISSA_FOUND | STABLE_6S
+   * f. Fetch final answer via turn "Copy as text" (or DOM fallback) -> synchronously validate with validateStudioAnswer (retry up to 3x in new chat if invalid) -> calibrate offset mode -> parseChunkMatches
    * g. Recycle Playwright page in same persistent context after every N finished window jobs (default 5)
    */
   public async runWindowJob(params: {
@@ -2243,6 +2539,8 @@ class StudioBrowserController {
     const MAX_ATTEMPTS = 3
     const MAX_PERMISSION_RETRIES = 5
     let permissionDeniedRetries = 0
+    const MAX_INVALID_RESULT_RETRIES = 3
+    let invalidResultRetries = 0
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       await this.waitIfPausedOrThrowIfStopped(scope)
@@ -2381,17 +2679,23 @@ class StudioBrowserController {
           await promptInput.press('Control+Enter')
         }
 
-        // Poll every 1 s up to 15-min timeout.
+        // CHANGE 1 & CHANGE 2: Poll every 1 s up to 10-min timeout.
         // 1) Check permission denied FIRST (highest priority).
-        // 2) Job is "alive" if Stop button is visible OR thinking/running spinner is visible.
-        // 3) Job is finished only when: Stop button is hidden AND spinner is gone AND Run button is enabled
-        //    AND extracted answer is non-empty and unchanged for 6 consecutive seconds.
+        // 2) Check error banners (internal error / something went wrong / failed to generate route straight to CHANGE 5 retry).
+        // 3) Check 3 independent done indicators (no Run-button-enabled requirement):
+        //    A) STOP_GONE: Stop button was seen at least once, and now Stop is hidden + scoped spinner is gone for 2 consecutive polls
+        //    B) HISSA_FOUND: candidateText contains both HISSA 1 and HISSA 2, and (!stopVisible || stableSeconds >= 3)
+        //    C) STABLE_6S: candidateText is non-empty and unchanged for 6 consecutive seconds
         const runStarted = Date.now()
-        const TIMEOUT_MS = 15 * 60_000
+        const TIMEOUT_MS = 10 * 60_000
         let rawAnswer = ''
         let lastCandidateText = ''
         let stableSeconds = 0
+        let stopEverSeen = false
+        let stopGoneConsecutivePolls = 0
+        let doneIndicator: 'STOP_GONE' | 'HISSA_FOUND' | 'STABLE_6S' | null = null
         let permissionDeniedTriggered = false
+        let transientBannerReason: string | null = null
 
         while (Date.now() - runStarted < TIMEOUT_MS) {
           await this.waitIfPausedOrThrowIfStopped(scope)
@@ -2432,10 +2736,10 @@ class StudioBrowserController {
           const ss = String(elapsed % 60).padStart(2, '0')
           this.logStep(`running ${mm}:${ss}`, jobLabel)
 
-          // Stricter error/quota/alert banner detection (real alert/banner containers + specific phrases only)
+          // Error/quota/alert banner detection (real alert/banner containers + specific phrases only)
           const errBannerText = await page.evaluate((sels) => {
             const strictRegex =
-              /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety)/i
+              /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
             for (const s of sels) {
               if (s.includes(':has-text(')) continue
               try {
@@ -2467,42 +2771,60 @@ class StudioBrowserController {
               )
               return this.runWindowJob({ ...params, sanitized: true })
             }
+            if (/(internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(errBannerText)) {
+              transientBannerReason = `error_banner:${errBannerText.slice(0, 80)}`
+              break
+            }
             throw new Error(`AI Studio banner error: ${errBannerText.slice(0, 180)}`)
           }
 
-          if (elapsed >= 3) {
-            const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
-            const stopVisible = Boolean(stopLoc)
+          const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
+          const stopVisible = Boolean(stopLoc)
+          if (stopVisible) {
+            stopEverSeen = true
+          }
+
+          if (elapsed >= 2) {
             const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
+            const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
 
-            // Job is alive if EITHER Stop button is visible OR thinking/running spinner is visible
-            if (stopVisible || spinnerVisible) {
-              stableSeconds = 0
-            } else {
-              const runLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 100)
-              const runVisibleAndEnabled = Boolean(
-                runLoc && (await runLoc.isEnabled().catch(() => false)),
-              )
-
-              const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
-              if (runVisibleAndEnabled && candidateText.length > 0) {
-                if (candidateText === lastCandidateText) {
-                  stableSeconds += 1
-                } else {
-                  lastCandidateText = candidateText
-                  stableSeconds = 1
-                }
-
-                if (stableSeconds >= 6) {
-                  rawAnswer = candidateText
-                  break
-                }
+            if (candidateText.length > 0) {
+              if (candidateText === lastCandidateText) {
+                stableSeconds += 1
               } else {
-                if (candidateText.length > 0) {
-                  lastCandidateText = candidateText
-                }
-                stableSeconds = 0
+                lastCandidateText = candidateText
+                stableSeconds = 1
               }
+            } else {
+              stableSeconds = 0
+            }
+
+            if (stopEverSeen && !stopVisible && !spinnerVisible) {
+              stopGoneConsecutivePolls += 1
+            } else {
+              stopGoneConsecutivePolls = 0
+            }
+
+            // Indicator A: STOP_GONE (Stop was seen at least once, now Stop + scoped spinner are gone for 2 consecutive polls)
+            if (stopEverSeen && !stopVisible && !spinnerVisible && stopGoneConsecutivePolls >= 2) {
+              doneIndicator = 'STOP_GONE'
+            }
+            // Indicator B: HISSA_FOUND (both HISSA 1 and HISSA 2 present in answer text, and Stop is gone OR text unchanged for 3s)
+            else if (
+              /HISSA\s*1\b/i.test(candidateText) &&
+              /HISSA\s*2\b/i.test(candidateText) &&
+              (!stopVisible || stableSeconds >= 3)
+            ) {
+              doneIndicator = 'HISSA_FOUND'
+            }
+            // Indicator C: STABLE_6S (answer text is non-empty and unchanged for 6 consecutive seconds)
+            else if (candidateText.length > 0 && stableSeconds >= 6) {
+              doneIndicator = 'STABLE_6S'
+            }
+
+            if (doneIndicator) {
+              this.logStep(`done by ${doneIndicator}`, jobLabel, 'success')
+              break
             }
           }
 
@@ -2515,11 +2837,54 @@ class StudioBrowserController {
           continue
         }
 
-        if (!rawAnswer) {
-          throw new Error(`Timed out waiting for stable answer from AI Studio for ${jobLabel}`)
+        // CHANGE 3 & CHANGE 4 & CHANGE 5:
+        // If a transient internal-error banner broke the loop, or after done/timeout, fetch and validate immediately.
+        // On timeout (doneIndicator === null), still attempt one fetch + validate in case the answer finished on screen.
+        let validationReason = transientBannerReason || ''
+        let fetchedSource: 'clipboard' | 'dom' = 'dom'
+
+        if (!transientBannerReason) {
+          const fetched = await this.fetchStudioResultFromTurnOrFallback(page)
+          fetchedSource = fetched.source
+          const validation = validateStudioAnswer(fetched.text, {
+            shortWindowSec: shortEndSec - shortStartSec,
+          })
+
+          if (validation.ok) {
+            rawAnswer = validation.cleanedText
+            if (validation.stats.softWarning) {
+              this.logStep('result coverage note', validation.stats.softWarning, 'warn')
+            }
+            this.logStep(
+              `result check OK (HISSA 1 + HISSA 2, ${validation.stats.totalValidHissa2Lines} lines, source=${fetchedSource})`,
+              `${rawAnswer.length} chars (matches=${validation.stats.matchLineCount}, notFound=${validation.stats.notFoundLineCount})`,
+              'success',
+            )
+          } else {
+            validationReason =
+              !doneIndicator && validation.reason === 'empty' ? 'timeout_10m' : validation.reason
+          }
         }
 
-        this.logStep('answer copied', `${rawAnswer.length} chars extracted (6s stable, thoughts excluded)`, 'success')
+        if (!rawAnswer) {
+          invalidResultRetries += 1
+          const badReason = validationReason || 'empty'
+          this.logStep(
+            `result BAD: ${badReason} -> naya chat, same window retry (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
+            jobLabel,
+            'warn',
+          )
+          onLog?.(
+            'warn',
+            `Studio result BAD (${badReason}) on ${jobLabel} — opening new chat and retrying same window (${invalidResultRetries}/${MAX_INVALID_RESULT_RETRIES})`,
+          )
+          if (invalidResultRetries > MAX_INVALID_RESULT_RETRIES) {
+            throw new Error(`INVALID_RESULT_EXHAUSTED: ${badReason}`)
+          }
+          // Immediate retry in a new chat with zero backoff wait and without consuming MAX_ATTEMPTS
+          attempt -= 1
+          continue
+        }
 
         // (f) Calibrate offset mode (relative 0:00 vs absolute startSec) and parse via parseChunkMatches!
         const calibrated = await this.calibrateAndParseMatches({
@@ -2553,7 +2918,10 @@ class StudioBrowserController {
         }
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err)
-        if (msg.includes('PERMISSION_DENIED_EXHAUSTED:')) {
+        if (
+          msg.includes('PERMISSION_DENIED_EXHAUSTED:') ||
+          msg.includes('INVALID_RESULT_EXHAUSTED:')
+        ) {
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
             username,
             effectiveRecycleInterval,
