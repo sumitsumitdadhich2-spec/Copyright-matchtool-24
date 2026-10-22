@@ -722,6 +722,271 @@ class StudioBrowserController {
   }
 
   /**
+   * Synchronize fallback `data-cmt-fallback-chip="true"` markers on attached media chips
+   * when AI Studio's custom element tag names change.
+   * Matches any compact prompt-area chip container that:
+   *  - contains the uploaded filename basename (or .mp4/.mov/.webm) next to a chip button, OR
+   *  - shows "N tokens" (e.g. "5,666 tokens", excluding the "X / 1,048,576 tokens" header) next to a settings/gear button.
+   */
+  private async syncFallbackMediaChips(page: Page, uploadedBasename: string): Promise<void> {
+    const primarySelector = STUDIO_SELECTORS.videoMediaChips.join(', ')
+    await page
+      .evaluate(
+        ({ primarySel, basename }) => {
+          document
+            .querySelectorAll('[data-cmt-fallback-chip]')
+            .forEach((el) => el.removeAttribute('data-cmt-fallback-chip'))
+
+          // If native custom-element selectors already match chips, only tag additional ones not covered
+          const primarySet = new Set<Element>(
+            primarySel ? Array.from(document.querySelectorAll(primarySel)) : [],
+          )
+
+          const isExcludedArea = (el: Element): boolean =>
+            Boolean(
+              el.closest(
+                'header, nav, ms-toolbar, ms-header, ms-run-settings, .run-settings, mat-dialog-container, [role="dialog"]',
+              ),
+            )
+
+          const isCloseOrRemoveButton = (btn: Element): boolean => {
+            const label = (
+              (btn.getAttribute('aria-label') || '') +
+              ' ' +
+              (btn.getAttribute('mattooltip') || '') +
+              ' ' +
+              (btn.getAttribute('title') || '') +
+              ' ' +
+              (btn.textContent || '')
+            )
+              .trim()
+              .toLowerCase()
+            return /\b(close|cancel|clear|remove|delete)\b|^×$|^x$/i.test(label)
+          }
+
+          const isSettingsOrGearButton = (btn: Element): boolean => {
+            if (isCloseOrRemoveButton(btn)) return false
+            const label = (
+              (btn.getAttribute('aria-label') || '') +
+              ' ' +
+              (btn.getAttribute('mattooltip') || '') +
+              ' ' +
+              (btn.getAttribute('title') || '') +
+              ' ' +
+              (btn.textContent || '') +
+              ' ' +
+              (btn.innerHTML || '')
+            ).toLowerCase()
+            if (/\b(run settings|toggle run settings|insert|add|run|stop)\b/i.test(label)) {
+              return false
+            }
+            return (
+              /\b(settings|tune|video_settings|edit|clip|configure|gear|options)\b/i.test(label) ||
+              Boolean(btn.querySelector('mat-icon, svg, span[class*="symbol" i], span[class*="icon" i]'))
+            )
+          }
+
+          const hasChipTokenText = (text: string): boolean => {
+            // Match e.g. "5,666 tokens" but NOT "5,666 / 1,048,576 tokens"
+            if (/[\d,]+\s*\/\s*[\d,]+\s*tokens?/i.test(text)) return false
+            return /\b[1-9][\d,]*\s*tokens?\b/i.test(text)
+          }
+
+          const baseLower = (basename || '').trim().toLowerCase()
+          const hasFilenameText = (text: string): boolean => {
+            const lower = text.toLowerCase()
+            if (baseLower && lower.includes(baseLower)) return true
+            return /\b[\w.-]+\.(mp4|mov|webm|mkv)\b/i.test(lower)
+          }
+
+          const allElements = Array.from(document.body.querySelectorAll('*'))
+          const candidateContainers: HTMLElement[] = []
+
+          for (const node of allElements) {
+            const el = node as HTMLElement
+            if (!el || isExcludedArea(el)) continue
+            if (el.tagName === 'BUTTON' || el.tagName === 'SCRIPT' || el.tagName === 'STYLE') continue
+
+            const rect = el.getBoundingClientRect()
+            if (rect.width < 30 || rect.width > 900 || rect.height < 14 || rect.height > 180) continue
+            if (el.outerHTML.length > 15000) continue
+
+            const text = (el.innerText || el.textContent || '').trim()
+            if (!text || text.length > 400) continue
+
+            const matchesName = hasFilenameText(text)
+            const matchesTokens = hasChipTokenText(text)
+            if (!matchesName && !matchesTokens) continue
+
+            const buttons = Array.from(el.querySelectorAll('button, [role="button"]'))
+            if (buttons.length === 0) continue
+
+            const hasGear = buttons.some(isSettingsOrGearButton)
+            const hasClose = buttons.some(isCloseOrRemoveButton)
+
+            // Require either:
+            // - "N tokens" next to a settings/gear button, OR
+            // - uploaded filename text + (settings/gear button OR "N tokens" OR both gear + close buttons)
+            const validByTokensAndGear = matchesTokens && hasGear
+            const validByName = matchesName && (hasGear || matchesTokens || (buttons.length >= 2 && hasClose))
+
+            if (validByTokensAndGear || validByName) {
+              candidateContainers.push(el)
+            }
+          }
+
+          // Keep only minimal (innermost) chip containers so each attached video is 1 chip
+          const minimalChips = candidateContainers.filter(
+            (c) => !candidateContainers.some((other) => other !== c && c.contains(other)),
+          )
+
+          for (const chip of minimalChips) {
+            const alreadyCovered = Array.from(primarySet).some(
+              (p) => p === chip || p.contains(chip) || chip.contains(p),
+            )
+            if (!alreadyCovered) {
+              chip.setAttribute('data-cmt-fallback-chip', 'true')
+            }
+          }
+        },
+        { primarySel: primarySelector, basename: uploadedBasename },
+      )
+      .catch(() => {})
+  }
+
+  /**
+   * Requirement 1: Dump detailed DOM diagnostics via this.logStep + save screenshot to DATA_DIR
+   * before throwing when media chip count does not increase.
+   */
+  private async dumpChipAttachDiagnostics(
+    page: Page,
+    label: string,
+    uploadedBasename: string,
+  ): Promise<void> {
+    try {
+      fs.mkdirSync(DATA_DIR, { recursive: true })
+      const shotPath = path.join(DATA_DIR, `studio-attach-fail-${label}-${Date.now()}.png`)
+      await page.screenshot({ path: shotPath, fullPage: true })
+      this.logStep('diag screenshot', `Saved to ${shotPath}`, 'warn')
+    } catch (shotErr) {
+      this.logStep('diag screenshot err', (shotErr as Error).message, 'warn')
+    }
+
+    try {
+      const diag = await page.evaluate((basename) => {
+        const needle = (basename || '.mp4').toLowerCase()
+        const all = Array.from(document.body.querySelectorAll('*'))
+        const matching = all.filter((el) => {
+          if (el.tagName === 'SCRIPT' || el.tagName === 'STYLE') return false
+          const t = ((el as HTMLElement).innerText || el.textContent || '').toLowerCase()
+          return t.includes(needle)
+        })
+
+        // Smallest element whose text contains the uploaded file's basename (has no child also matching, or shortest outerHTML)
+        const smallest =
+          matching
+            .filter((el) => !matching.some((child) => child !== el && el.contains(child)))
+            .sort((a, b) => a.outerHTML.length - b.outerHTML.length)[0] || null
+
+        if (!smallest) {
+          return {
+            found: false,
+            outerHtml: `No element found containing "${basename}". Body text snippet: ${(document.body.innerText || '').slice(0, 600)}`,
+            ancestors: 'none',
+            buttons: 'none',
+          }
+        }
+
+        // (a) outerHTML (max 3000 chars) of the smallest element (plus its L2 parent if smallest is just a leaf text node)
+        const smallestHtml = smallest.outerHTML.slice(0, 1500)
+        const parent2Html =
+          smallest.parentElement?.parentElement?.outerHTML.slice(0, 1500) ||
+          smallest.parentElement?.outerHTML.slice(0, 1500) ||
+          ''
+        const combinedOuterHtml = (
+          parent2Html && parent2Html !== smallestHtml
+            ? `[smallest]: ${smallestHtml} | [ancestor-L2]: ${parent2Html}`
+            : smallestHtml
+        ).slice(0, 3000)
+
+        // (b) ancestor tag names / classes / aria-labels up 4 levels
+        const ancestorDescriptions: string[] = []
+        let curr: Element | null = smallest
+        for (let level = 0; level <= 4 && curr; level++) {
+          const tag = curr.tagName.toLowerCase()
+          const cls = (curr.getAttribute('class') || '').trim()
+          const aria = (curr.getAttribute('aria-label') || '').trim()
+          ancestorDescriptions.push(
+            `L${level}: <${tag}${cls ? ` class="${cls}"` : ''}${aria ? ` aria-label="${aria}"` : ''}>`,
+          )
+          curr = curr.parentElement
+        }
+
+        // (c) all button aria-labels inside it (and inside up to 4 ancestor levels so sibling buttons inside the chip are included)
+        const searchRoot =
+          smallest.parentElement?.parentElement?.parentElement?.parentElement ||
+          smallest.parentElement?.parentElement ||
+          smallest
+        const btnsInsideSmallest = Array.from(smallest.querySelectorAll('button, [role="button"]')).map(
+          (b) =>
+            `[in-smallest] aria="${b.getAttribute('aria-label') || ''}" tooltip="${b.getAttribute('mattooltip') || ''}" text="${(b.textContent || '').trim()}"`,
+        )
+        const btnsInsideChipRoot = Array.from(searchRoot.querySelectorAll('button, [role="button"]')).map(
+          (b) =>
+            `[in-L4] aria="${b.getAttribute('aria-label') || ''}" tooltip="${b.getAttribute('mattooltip') || ''}" text="${(b.textContent || '').trim()}"`,
+        )
+
+        return {
+          found: true,
+          outerHtml: combinedOuterHtml,
+          ancestors: ancestorDescriptions.join(' -> '),
+          buttons:
+            [...btnsInsideSmallest, ...btnsInsideChipRoot].join(' ; ') ||
+            'no buttons found',
+        }
+      }, uploadedBasename)
+
+      this.logStep(`diag (a) outerHTML [${label}]`, diag.outerHtml, 'warn')
+      this.logStep(`diag (b) ancestors [${label}]`, diag.ancestors, 'warn')
+      this.logStep(`diag (c) buttons [${label}]`, diag.buttons, 'warn')
+      console.warn(`[Studio Attach Diag - ${label}] (a) outerHTML:`, diag.outerHtml)
+      console.warn(`[Studio Attach Diag - ${label}] (b) ancestors:`, diag.ancestors)
+      console.warn(`[Studio Attach Diag - ${label}] (c) buttons:`, diag.buttons)
+    } catch (diagErr) {
+      this.logStep('diag eval err', (diagErr as Error).message, 'warn')
+    }
+  }
+
+  /**
+   * Requirement 3: Dump open Video Settings dialog / overlay DOM when start/end/FPS inputs are not found.
+   */
+  private async dumpVideoDialogDiagnostics(page: Page, label: string, reason: string): Promise<void> {
+    try {
+      const dump = await page.evaluate(() => {
+        const dialogEl = document.querySelector(
+          'mat-dialog-container, [role="dialog"], .cdk-overlay-pane, .video-settings-container',
+        )
+        const dialogHtml = dialogEl
+          ? dialogEl.outerHTML.slice(0, 3000)
+          : 'No mat-dialog-container / [role="dialog"] / .cdk-overlay-pane found in DOM'
+        const inputs = Array.from(document.querySelectorAll('input'))
+          .map(
+            (inp) =>
+              `<input type="${inp.type}" aria-label="${inp.getAttribute('aria-label') || ''}" placeholder="${inp.getAttribute('placeholder') || ''}" value="${inp.value}">`,
+          )
+          .join(' | ')
+        return { dialogHtml, inputs }
+      })
+      this.logStep(`diag dialog HTML [${label}]`, `${reason} :: ${dump.dialogHtml}`, 'warn')
+      this.logStep(`diag dialog inputs [${label}]`, dump.inputs || 'no inputs on page', 'warn')
+      console.warn(`[Studio Dialog Diag - ${label}] ${reason} ::`, dump.dialogHtml)
+      console.warn(`[Studio Dialog Diag - ${label}] inputs:`, dump.inputs)
+    } catch (err) {
+      this.logStep('diag dialog err', (err as Error).message, 'warn')
+    }
+  }
+
+  /**
    * FIX 1: Attach a YouTube link or Drive file or local file as a video asset in the prompt,
    * verify media chip count increased, verify the added chip matches the intended video,
    * configure Start Time, End Time, and FPS = 24 via the Video Settings dialog,
@@ -743,8 +1008,19 @@ class StudioBrowserController {
     const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
     await this.waitIfPausedOrThrowIfStopped(scope)
 
-    const chipSelector = STUDIO_SELECTORS.videoMediaChips.join(', ')
-    const chipsLocator = page.locator(chipSelector)
+    const uploadedBasename =
+      driveFileName ||
+      (localFilePath ? path.basename(localFilePath) : '') ||
+      (youtubeUrl ? 'youtube' : '')
+
+    // Combined locator: STUDIO_SELECTORS.videoMediaChips + fallback chip locator ([data-cmt-fallback-chip="true"])
+    const combinedChipSelector = [
+      ...STUDIO_SELECTORS.videoMediaChips,
+      '[data-cmt-fallback-chip="true"]',
+    ].join(', ')
+    const chipsLocator = page.locator(combinedChipSelector)
+
+    await this.syncFallbackMediaChips(page, '')
     const chipsBefore = await chipsLocator.count()
 
     if (youtubeUrl) {
@@ -846,28 +1122,26 @@ class StudioBrowserController {
       throw new Error(`No media source available to attach ${label} video in Studio`)
     }
 
-    // FIX 1a: Wait for the new video chip to appear, and THROW if chip count did not increase
+    // FIX 1a: Wait for the new video chip to appear via combined locator, and dump diagnostics BEFORE throwing if chip count did not increase
     const waitDeadline = Date.now() + 90_000
     let chipCount = chipsBefore
     while (Date.now() < waitDeadline) {
       await this.waitIfPausedOrThrowIfStopped(scope)
+      await this.syncFallbackMediaChips(page, uploadedBasename)
       chipCount = await chipsLocator.count()
       if (chipCount > chipsBefore) break
       await new Promise((r) => setTimeout(r, 500))
     }
 
     if (chipCount <= chipsBefore) {
+      await this.dumpChipAttachDiagnostics(page, label, uploadedBasename)
       throw new Error(
         `Studio video attach failed for ${label}: media chip count did not increase within 90s (before=${chipsBefore}, after=${chipCount})`,
       )
     }
 
     // FIX 1b: Target the chip we just added (at index chipsBefore, or matching expected name among newly added chips)
-    const expectedNameHint = (
-      driveFileName ||
-      (localFilePath ? path.basename(localFilePath) : '') ||
-      (youtubeUrl ? 'youtube' : '')
-    ).toLowerCase()
+    const expectedNameHint = uploadedBasename.toLowerCase()
 
     let targetChipIndex = chipsBefore
     if (expectedNameHint) {
@@ -892,7 +1166,7 @@ class StudioBrowserController {
       throw new Error(`Studio clip config failed: target media chip #${targetChipIndex} for ${label} not found`)
     }
 
-    // Verify the chip does not belong to the wrong video when attaching the second video (movie)
+    // Requirement 4: Keep the existing "movie chip must not resolve to index 0" check working with the new locator
     if (label === 'movie' && targetChipIndex === 0 && chipsBefore >= 1) {
       throw new Error(`Studio clip config failed: movie chip resolved to index 0 (short video chip)`)
     }
@@ -911,7 +1185,7 @@ class StudioBrowserController {
       await targetChip.hover().catch(() => {})
       await new Promise((r) => setTimeout(r, 250))
 
-      // Prefer explicit video settings button inside the chip, fallback to first button or chip click
+      // Prefer explicit video settings (gear) button inside the chip; never click the X/remove button
       let openedDialog = false
       for (const btnSel of STUDIO_SELECTORS.videoChipSettingsButton) {
         const btn = targetChip.locator(btnSel).first()
@@ -922,10 +1196,29 @@ class StudioBrowserController {
         }
       }
       if (!openedDialog) {
-        const settingsBtnInside = targetChip.locator('button').first()
-        if ((await settingsBtnInside.count()) > 0) {
-          await settingsBtnInside.click()
-        } else {
+        // Fallback: find the first button inside targetChip that is NOT a close/remove/delete button
+        const chipButtons = targetChip.locator('button, [role="button"]')
+        const btnCount = await chipButtons.count()
+        for (let bIdx = 0; bIdx < btnCount; bIdx++) {
+          const btn = chipButtons.nth(bIdx)
+          const btnMeta = (
+            ((await btn.getAttribute('aria-label').catch(() => '')) || '') +
+            ' ' +
+            ((await btn.getAttribute('mattooltip').catch(() => '')) || '') +
+            ' ' +
+            ((await btn.getAttribute('title').catch(() => '')) || '') +
+            ' ' +
+            (await btn.innerText().catch(() => ''))
+          )
+            .trim()
+            .toLowerCase()
+          if (!/\b(close|cancel|clear|remove|delete)\b|^×$|^x$/i.test(btnMeta)) {
+            await btn.click()
+            openedDialog = true
+            break
+          }
+        }
+        if (!openedDialog) {
           await targetChip.click()
         }
       }
@@ -937,10 +1230,13 @@ class StudioBrowserController {
 
       if (!startInput) {
         lastConfigError = `start time input not found for ${label}`
+        await this.dumpVideoDialogDiagnostics(page, label, lastConfigError)
       } else if (!endInput) {
         lastConfigError = `end time input not found for ${label}`
+        await this.dumpVideoDialogDiagnostics(page, label, lastConfigError)
       } else if (!fpsInput) {
         lastConfigError = `fps input not found for ${label}`
+        await this.dumpVideoDialogDiagnostics(page, label, lastConfigError)
       } else {
         await startInput.click({ clickCount: 3 })
         await startInput.fill(startStr)
@@ -971,6 +1267,9 @@ class StudioBrowserController {
           lastConfigError = `start time (expected ${startStr} [${Math.floor(startSec)}s], read back "${readStartRaw}") on ${label}`
         } else if (readEndSec === null || Math.abs(readEndSec - Math.floor(endSec)) > 1) {
           lastConfigError = `end time (expected ${endStr} [${Math.floor(endSec)}s], read back "${readEndRaw}") on ${label}`
+        }
+        if (lastConfigError) {
+          await this.dumpVideoDialogDiagnostics(page, label, lastConfigError)
         }
       }
 
