@@ -437,7 +437,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             title="Movie"
             subtitle={
               scan?.chunkScanEngine === 'studio'
-                ? 'Compressed once to movie_360p.mp4 (<= 390 MB) & uploaded to Google Drive "CMT"'
+                ? 'Compressed once to movie_360p.mp4 (<= 390 MB, local direct upload)'
                 : 'Any length — chunked into 1-min pieces'
             }
             name={movieServer ? scan?.movieName : movieLocal?.name}
@@ -450,12 +450,12 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             extraInfo={reused[movieKey] ? 'Already on server — linked instantly, nothing uploaded' : undefined}
           />
 
-          {/* Requirement 2: movie_360p compression + Google Drive "CMT" upload status */}
+          {/* Requirement 2: movie_360p local compression status */}
           {(scan?.movie360p || (movieServer && scan?.chunkScanEngine === 'studio')) && (
             <div className="rounded-lg border border-border/80 bg-card/70 p-2.5 text-xs space-y-1.5">
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <span className="font-medium text-foreground flex items-center gap-1.5">
-                  {scan?.movie360p?.status === 'compressing' || scan?.movie360p?.status === 'uploading_drive' ? (
+                  {scan?.movie360p?.status === 'compressing' ? (
                     <Loader2 className="size-3.5 animate-spin text-primary" />
                   ) : null}
                   Studio Movie ({scan?.movie360p?.resolution || '360p'} · 24fps CFR · &lt;= 390 MB):
@@ -463,56 +463,47 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
                 <span className="font-mono text-[11px] text-muted-foreground">
                   {scan?.movie360p?.status === 'compressing' &&
                     `Compressing ${scan.movie360p.progress ?? 0}%`}
-                  {scan?.movie360p?.status === 'uploading_drive' &&
-                    `Uploading to Drive "CMT" ${scan.movie360p.driveUploadProgress ?? 0}%`}
-                  {scan?.movie360p?.status === 'ready' &&
-                    (scan.movie360p.driveFileId
-                      ? `✓ Drive CMT ready (${scan.movie360p.sizeBytes ? fmtBytes(scan.movie360p.sizeBytes) : ''})`
-                      : `Compressed locally (${scan.movie360p.sizeBytes ? fmtBytes(scan.movie360p.sizeBytes) : ''}) — Drive pending`)}
+                  {(scan?.movie360p?.status === 'ready' || scan?.movie360p?.status === 'uploading_drive') &&
+                    `✓ Local - ready${scan.movie360p.sizeBytes ? ` (${fmtBytes(scan.movie360p.sizeBytes)})` : ''}`}
                   {scan?.movie360p?.status === 'error' && 'Error'}
                   {!scan?.movie360p && 'Not prepared yet'}
                 </span>
               </div>
 
-              {(scan?.movie360p?.status === 'compressing' ||
-                scan?.movie360p?.status === 'uploading_drive') && (
+              {scan?.movie360p?.status === 'compressing' && (
                 <div className="progress-track">
                   <div
                     className="progress-fill"
                     style={{
-                      width: `${
-                        scan.movie360p.status === 'compressing'
-                          ? scan.movie360p.progress || 0
-                          : scan.movie360p.driveUploadProgress || 0
-                      }%`,
+                      width: `${scan.movie360p.progress || 0}%`,
                     }}
                   />
                 </div>
               )}
 
-              {scan?.movie360p?.warning && (
-                <p className="text-[11px] text-amber-400 leading-snug">⚠ {scan.movie360p.warning}</p>
-              )}
+              {scan?.movie360p?.warning &&
+                !/google drive not connected/i.test(scan.movie360p.warning) && (
+                  <p className="text-[11px] text-amber-400 leading-snug">⚠ {scan.movie360p.warning}</p>
+                )}
               {scan?.movie360p?.error && (
                 <p className="text-[11px] text-destructive leading-snug">✗ {scan.movie360p.error}</p>
               )}
 
-              {movieServer && (!scan?.movie360p?.driveFileId || scan?.movie360p?.status === 'error') && (
-                <div className="pt-1 flex justify-end">
-                  <button
-                    type="button"
-                    onClick={() => void triggerStudioMovieSync()}
-                    disabled={
-                      syncingDrive ||
-                      scan?.movie360p?.status === 'compressing' ||
-                      scan?.movie360p?.status === 'uploading_drive'
-                    }
-                    className="rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-[11px] font-medium text-primary hover:bg-primary/20 disabled:opacity-40"
-                  >
-                    {syncingDrive ? 'Starting...' : 'Compress & Upload movie_360p to Drive "CMT"'}
-                  </button>
-                </div>
-              )}
+              {movieServer &&
+                scan?.movie360p?.status !== 'ready' &&
+                scan?.movie360p?.status !== 'uploading_drive' &&
+                scan?.movie360p?.status !== 'compressing' && (
+                  <div className="pt-1 flex justify-end">
+                    <button
+                      type="button"
+                      onClick={() => void triggerStudioMovieSync()}
+                      disabled={syncingDrive}
+                      className="rounded-md border border-primary/40 bg-primary/10 px-2.5 py-1 text-[11px] font-medium text-primary hover:bg-primary/20 disabled:opacity-40"
+                    >
+                      {syncingDrive ? 'Starting...' : 'Compress movie_360p.mp4 (Local)'}
+                    </button>
+                  </div>
+                )}
             </div>
           )}
         </div>
@@ -524,7 +515,7 @@ export function UploadPanel({ scan, selectedScanId, onScanCreated, refresh }: Pr
             <span className="flex items-center gap-1.5">
               <Loader2 className="size-3.5 animate-spin text-primary" aria-hidden />
               {scan?.chunkScanEngine === 'studio'
-                ? 'Compressing movie_360p.mp4 (24fps CFR, <= 390 MB) & uploading to Google Drive "CMT"...'
+                ? 'Compressing movie_360p.mp4 (24fps CFR, <= 390 MB, local direct upload)...'
                 : `ffmpeg chunking movie into ${scan?.chunkCount} one-minute chunks...`}
             </span>
             <span className="font-mono">{scan?.chunkingProgress}%</span>

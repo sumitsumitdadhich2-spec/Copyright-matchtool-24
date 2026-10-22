@@ -66,7 +66,7 @@ export async function POST(req: Request, ctx: { params: Promise<{ id: string }> 
     scan,
     'info',
     engine === 'studio'
-      ? `Trim confirmed (${isFull ? `FULL movie ${fmtDur(dur)}` : `${fmtDur(start)} → ${fmtDur(end)}`}) — Gemini Studio mode: preparing movie_360p.mp4 + Drive upload (${count} logical 1-min slots)`
+      ? `Trim confirmed (${isFull ? `FULL movie ${fmtDur(dur)}` : `${fmtDur(start)} → ${fmtDur(end)}`}) — Gemini Studio mode: preparing movie_360p.mp4 (local direct upload, ${count} logical 1-min slots)`
       : isFull
         ? `Trim confirmed: FULL movie (${fmtDur(dur)}) — cutting into ${count} one-minute chunks`
         : `Trim confirmed: ${fmtDur(start)} → ${fmtDur(end)} (${fmtDur(rangeDur)}) — cutting ONLY this range into ${count} chunk(s); reported movie timestamps stay absolute to the original`,

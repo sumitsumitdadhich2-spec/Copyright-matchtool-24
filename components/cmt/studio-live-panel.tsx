@@ -657,30 +657,28 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
                 <div className="rounded border border-border bg-secondary/30 p-2 text-[11px] space-y-1">
                   <div className="flex items-center justify-between">
                     <span className="font-medium text-foreground">
-                      Movie 360p + Drive Cache
+                      Movie 360p (Direct Local Upload)
                     </span>
                     <span className="font-mono text-[10px] uppercase text-emerald-400">
-                      {scan.movie360p.status}
+                      {scan.movie360p.status === 'ready' || scan.movie360p.status === 'uploading_drive'
+                        ? 'Local - ready'
+                        : scan.movie360p.status}
                     </span>
                   </div>
                   <div className="text-[10px] text-muted-foreground flex flex-wrap gap-x-3 gap-y-0.5 font-mono">
-                    {scan.movie360p.resolution && <span>{scan.movie360p.resolution}p @ 24fps</span>}
+                    {scan.movie360p.resolution && <span>{scan.movie360p.resolution} @ 24fps</span>}
                     {scan.movie360p.bitrateKbps && <span>{scan.movie360p.bitrateKbps} kbps</span>}
                     {scan.movie360p.sizeBytes && (
                       <span>{(scan.movie360p.sizeBytes / (1024 * 1024)).toFixed(1)} MB</span>
                     )}
-                    {scan.movie360p.driveFileName && (
-                      <span className="text-emerald-300 truncate max-w-[180px]">
-                        Drive: {scan.movie360p.driveFileName}
-                      </span>
-                    )}
                   </div>
-                  {scan.movie360p.warning && (
-                    <div className="text-[10px] text-amber-300 flex items-center gap-1">
-                      <AlertCircle className="h-3 w-3 shrink-0" />
-                      <span>{scan.movie360p.warning}</span>
-                    </div>
-                  )}
+                  {scan.movie360p.warning &&
+                    !/google drive not connected/i.test(scan.movie360p.warning) && (
+                      <div className="text-[10px] text-amber-300 flex items-center gap-1">
+                        <AlertCircle className="h-3 w-3 shrink-0" />
+                        <span>{scan.movie360p.warning}</span>
+                      </div>
+                    )}
                 </div>
               )}
 

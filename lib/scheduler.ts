@@ -1716,7 +1716,7 @@ class Scheduler {
     try {
       if (job.stopping || studioController.isStopping(stopScope)) return
 
-      // 1. Ensure movie_360p.mp4 is compressed and uploaded to Drive "CMT"
+      // 1. Ensure movie_360p.mp4 is compressed locally
       const mediaDir = scanMediaDir(scan.id)
       const movie360Path = path.join(mediaDir, 'movie_360p.mp4')
       if (
@@ -1724,7 +1724,7 @@ class Scheduler {
         scan.movie360p.status !== 'ready' ||
         !fs.existsSync(movie360Path)
       ) {
-        addLog(scan, 'info', 'Studio engine: ensuring movie_360p.mp4 is compressed and uploaded to Google Drive "CMT"...')
+        addLog(scan, 'info', 'Studio engine: ensuring movie_360p.mp4 is compressed...')
         this.mark(job)
         await prepareStudioMovie360pAndDrive(scan.id, undefined, scan.movieDuration || undefined, owner)
         const refreshed = getScan(scan.id)
@@ -1733,8 +1733,8 @@ class Scheduler {
         }
       }
 
-      // 2. Ensure short video source (YouTube URL if present, else Drive/local file <= 390 MB)
-      let shortReady: { localPath: string; driveFileId?: string; driveFileName?: string } | null = null
+      // 2. Ensure short video source (YouTube URL if present, else local file <= 390 MB)
+      let shortReady: { localPath: string } | null = null
       if (!scan.shortYoutubeUrl) {
         shortReady = await ensureStudioShortReady(scan.id, owner)
       }
@@ -1801,11 +1801,9 @@ class Scheduler {
             maxInputTokens: studioCfg.studioMaxInputTokens,
             pageRecycleInterval: studioCfg.studioPageRecycleInterval,
             shortYoutubeUrl: scan.shortYoutubeUrl,
-            shortDriveFileName: shortReady?.driveFileName || scan.shortDriveFileName,
             shortLocalPath: shortReady?.localPath || path.join(mediaDir, 'short.mp4'),
             shortStartSec: shortPart.startSec,
             shortEndSec: shortPart.endSec,
-            movieDriveFileName: scan.movie360p?.driveFileName,
             movieLocalPath: movie360Path,
             movieStartSec: movieBlock.startSec,
             movieEndSec: movieBlock.endSec,

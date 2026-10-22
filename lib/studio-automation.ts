@@ -1723,11 +1723,16 @@ class StudioBrowserController {
     // FIX 1a: Wait for the new video chip to appear (via chip count increase OR second success signal:
     // button[aria-label="Remove media" i] count increased OR header token count increased)
     // AND wait until the chip finishes "Loading..." so its gear button ("Edit video options") is ready.
-    const waitDeadline = Date.now() + 90_000
+    // A local 390 MB upload can take longer than 90s, so use a 5-minute (300_000ms) deadline for local file uploads.
+    const isLocalFileUpload = Boolean(!youtubeUrl && !driveFileName && localFilePath)
+    const waitTimeoutMs = isLocalFileUpload ? 300_000 : 90_000
+    const uploadWaitStartedAt = Date.now()
+    const waitDeadline = uploadWaitStartedAt + waitTimeoutMs
     let chipCount = chipsBefore
     let removeAfter = removeBefore
     let headerTokensAfter = headerTokensBefore
     let attachSucceeded = false
+    let lastLoggedUploadSec = -1
 
     while (Date.now() < waitDeadline) {
       await this.waitIfPausedOrThrowIfStopped(scope)
@@ -1769,7 +1774,17 @@ class StudioBrowserController {
           }
         }
       }
-      await new Promise((r) => setTimeout(r, 500))
+
+      const elapsedUploadSec = Math.max(1, Math.floor((Date.now() - uploadWaitStartedAt) / 1000))
+      if (isLocalFileUpload && elapsedUploadSec !== lastLoggedUploadSec) {
+        lastLoggedUploadSec = elapsedUploadSec
+        this.logStep(
+          `uploading ${uploadedBasename || `${label}.mp4`} to AI Studio... ${elapsedUploadSec}s`,
+          label,
+        )
+      }
+
+      await new Promise((r) => setTimeout(r, 1000))
     }
 
     if (!attachSucceeded) {
@@ -1789,7 +1804,7 @@ class StudioBrowserController {
     if (!attachSucceeded) {
       await this.dumpChipAttachDiagnostics(page, label, uploadedBasename)
       throw new Error(
-        `Studio video attach failed for ${label}: media chip count did not increase within 90s (before=${chipsBefore}, after=${chipCount}, removeBefore=${removeBefore}, removeAfter=${removeAfter}, tokensBefore=${headerTokensBefore}, tokensAfter=${headerTokensAfter})`,
+        `Studio video attach failed for ${label}: media chip count did not increase within ${Math.round(waitTimeoutMs / 1000)}s (before=${chipsBefore}, after=${chipCount}, removeBefore=${removeBefore}, removeAfter=${removeAfter}, tokensBefore=${headerTokensBefore}, tokensAfter=${headerTokensAfter})`,
       )
     }
 

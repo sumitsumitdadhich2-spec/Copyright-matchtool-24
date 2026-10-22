@@ -708,7 +708,7 @@ export async function finalizeUploadedMedia(
         addLog(
           scan,
           'info',
-          `Movie uploaded: ${name} (${fmtDur(duration)}) — Gemini Studio mode active: compressing once to movie_360p.mp4 (24fps CFR, <= 390 MB) + auto-uploading to Google Drive "CMT" folder (no per-chunk cutting)`,
+          `Movie uploaded: ${name} (${fmtDur(duration)}) — Gemini Studio mode active: compressing once to movie_360p.mp4 (24fps CFR, <= 390 MB, local direct upload to AI Studio)`,
         )
         saveScan(scan, { immediate: true })
         void prepareStudioMovie360pAndDrive(id, dest, duration, owner)
@@ -794,11 +794,17 @@ export async function finalizeUploadedMedia(
   return { ok: true, duration, size }
 }
 
+/**
+ * When true, AI Studio scans attach videos via direct local file upload
+ * (skipping the Google Drive upload hop). Flip to false to re-enable Drive upload.
+ */
+export const STUDIO_DIRECT_UPLOAD = true
+
 const activeStudioMovieJobs = new Map<string, Promise<void>>()
 
 /**
- * Compress movie once into movie_360p.mp4 (360p or 288p if <300kbps, 24fps CFR, H.264, mono ~48k AAC, <=390 MB)
- * and auto-upload to Google Drive folder "CMT" via resumable upload.
+ * Compress movie once into movie_360p.mp4 (360p or 288p if <300kbps, 24fps CFR, H.264, mono ~48k AAC, <=390 MB).
+ * When STUDIO_DIRECT_UPLOAD is true, marks movie360p ready immediately after local compression.
  */
 export function prepareStudioMovie360pAndDrive(
   scanId: string,
@@ -826,15 +832,18 @@ export function prepareStudioMovie360pAndDrive(
         warning?: string
       }
 
-      // Check if movie_360p.mp4 already exists on disk (e.g. only Drive upload needed)
+      // Check if movie_360p.mp4 already exists on disk
       if (fs.existsSync(out360pPath) && fs.statSync(out360pPath).size > 10_000) {
         const sizeBytes = fs.statSync(out360pPath).size
+        const prevWarning = initialScan?.movie360p?.warning
+        const cleanWarning =
+          prevWarning && /google drive not connected/i.test(prevWarning) ? undefined : prevWarning
         resInfo = {
           outputFile: out360pPath,
           resolution: initialScan?.movie360p?.resolution || '360p',
           bitrateKbps: initialScan?.movie360p?.bitrateKbps || 500,
           sizeBytes,
-          warning: initialScan?.movie360p?.warning,
+          warning: cleanWarning,
         }
       } else {
         const s0 = getScan(scanId)
@@ -863,8 +872,9 @@ export function prepareStudioMovie360pAndDrive(
                 progress: pct,
                 updatedAt: Date.now(),
               }
-              // Map compression to 0..60% of overall preparation bar
-              s.chunkingProgress = Math.min(60, Math.round(pct * 0.6))
+              s.chunkingProgress = STUDIO_DIRECT_UPLOAD
+                ? Math.min(99, Math.round(pct))
+                : Math.min(60, Math.round(pct * 0.6))
               saveScan(s)
             }
           },
@@ -885,7 +895,27 @@ export function prepareStudioMovie360pAndDrive(
         }
       }
 
-      // Auto-upload movie_360p.mp4 to Google Drive folder "CMT"
+      if (STUDIO_DIRECT_UPLOAD) {
+        const sReady = getScan(scanId)
+        if (sReady) {
+          sReady.movie360p = {
+            status: 'ready',
+            progress: 100,
+            resolution: resInfo.resolution,
+            bitrateKbps: resInfo.bitrateKbps,
+            sizeBytes: resInfo.sizeBytes,
+            warning: resInfo.warning,
+            updatedAt: Date.now(),
+          }
+          sReady.chunkingProgress = 100
+          sReady.status = 'ready'
+          addLog(sReady, 'info', 'movie_360p.mp4 ready (local, direct upload to AI Studio)')
+          saveScan(sReady, { immediate: true })
+        }
+        return
+      }
+
+      // Auto-upload movie_360p.mp4 to Google Drive folder "CMT" (only when STUDIO_DIRECT_UPLOAD is false)
       const driveTokens = await loadUserDriveTokens(owner)
       const safeMovieBase = (initialScan?.movieName || 'movie')
         .replace(/\.[^.]+$/, '')
@@ -902,18 +932,11 @@ export function prepareStudioMovie360pAndDrive(
             resolution: resInfo.resolution,
             bitrateKbps: resInfo.bitrateKbps,
             sizeBytes: resInfo.sizeBytes,
-            warning:
-              resInfo.warning ||
-              'Google Drive not connected yet — connect Drive in Settings so movie_360p.mp4 can be uploaded to the "CMT" folder before Studio scan starts.',
+            warning: resInfo.warning,
             updatedAt: Date.now(),
           }
           sNoDrive.chunkingProgress = 100
           sNoDrive.status = 'ready'
-          addLog(
-            sNoDrive,
-            'warn',
-            'movie_360p.mp4 compressed locally, but Google Drive is not connected yet. Connect Drive in Settings to auto-upload to folder "CMT".',
-          )
           saveScan(sNoDrive, { immediate: true })
         }
         return
@@ -988,7 +1011,7 @@ export function prepareStudioMovie360pAndDrive(
         }
         sErr.chunkingProgress = 100
         if (sErr.status === 'chunking') sErr.status = 'ready'
-        addLog(sErr, 'error', `Studio movie_360p preparation/Drive upload error: ${msg}`)
+        addLog(sErr, 'error', `Studio movie_360p preparation error: ${msg}`)
         saveScan(sErr, { immediate: true })
       }
     } finally {
@@ -1002,12 +1025,12 @@ export function prepareStudioMovie360pAndDrive(
 
 /**
  * Ensure the short video is ready for Gemini Studio attachment when no YouTube URL was provided:
- * compresses to <= 390 MB if needed and uploads to Google Drive "CMT" folder (or returns local path).
+ * compresses to <= 390 MB if needed and returns the local path for direct upload to AI Studio.
  */
 export async function ensureStudioShortReady(
   scanId: string,
-  owner: string,
-): Promise<{ localPath: string; driveFileId?: string; driveFileName?: string }> {
+  _owner?: string,
+): Promise<{ localPath: string }> {
   const scan = getScan(scanId)
   const mediaDir = scanMediaDir(scanId)
   const rawShortPath = localMediaPath(scanId, 'short')
@@ -1032,39 +1055,6 @@ export async function ensureStudioShortReady(
       })
     }
     targetShortPath = short360p
-  }
-
-  if (scan?.shortDriveFileId && scan?.shortDriveFileName) {
-    return {
-      localPath: targetShortPath,
-      driveFileId: scan.shortDriveFileId,
-      driveFileName: scan.shortDriveFileName,
-    }
-  }
-
-  const driveTokens = await loadUserDriveTokens(owner)
-  if (driveTokens?.refresh_token) {
-    const safeShortBase = (scan?.shortName || 'short')
-      .replace(/\.[^.]+$/, '')
-      .replace(/[^a-zA-Z0-9._-]+/g, '_')
-      .slice(0, 48)
-    const driveFileName = `cmt-${scanId}-${safeShortBase}_short.mp4`
-    const up = await uploadFileToDriveResumable({
-      username: owner,
-      localFilePath: targetShortPath,
-      driveFileName,
-    })
-    const latest = getScan(scanId)
-    if (latest) {
-      latest.shortDriveFileId = up.fileId
-      latest.shortDriveFileName = up.fileName
-      saveScan(latest)
-    }
-    return {
-      localPath: targetShortPath,
-      driveFileId: up.fileId,
-      driveFileName: up.fileName,
-    }
   }
 
   return { localPath: targetShortPath }
