@@ -6,6 +6,10 @@ export interface StudioUserConfig {
   chunkScanEngine: ChunkScanEngine
   studioModelName: string
   studioMaxOutputTokens: number
+  /** Optional override for max input tokens before shrinking; null/0 = auto (1_048_576 - studioMaxOutputTokens - 5_000) */
+  studioMaxInputTokens: number | null
+  /** Close and reopen Playwright page in the same persistent context after every N finished window jobs (default 5) */
+  studioPageRecycleInterval: number
   studioWindowMinutes: number
   studioShortPartMinutes: number
   studioWindowOverlapSec: number
@@ -32,6 +36,9 @@ export interface PublicStudioSettings {
   chunkScanEngine: ChunkScanEngine
   studioModelName: string
   studioMaxOutputTokens: number
+  studioMaxInputTokens: number | null
+  effectiveMaxInputTokens: number
+  studioPageRecycleInterval: number
   studioWindowMinutes: number
   studioShortPartMinutes: number
   studioWindowOverlapSec: number
@@ -65,10 +72,35 @@ export interface PlaywrightCookie {
   sameSite?: 'Strict' | 'Lax' | 'None'
 }
 
+export const STUDIO_CONTEXT_WINDOW_TOKENS = 1_048_576
+export const STUDIO_SAFETY_MARGIN_TOKENS = 5_000
+
+/**
+ * Compute the input token shrink threshold:
+ * Default (auto): 1_048_576 - maxOutputTokens - 5_000 (with maxOutputTokens = 65_536 this is 978_040).
+ * If user sets a custom studioMaxInputTokens > 0, use that override.
+ */
+export function computeEffectiveMaxInputTokens(
+  maxOutputTokens: number,
+  customMaxInputTokens?: number | null,
+): number {
+  if (
+    typeof customMaxInputTokens === 'number' &&
+    Number.isFinite(customMaxInputTokens) &&
+    customMaxInputTokens > 0
+  ) {
+    return Math.floor(customMaxInputTokens)
+  }
+  const out = Math.max(1024, Math.min(65536, Number(maxOutputTokens) || 65536))
+  return STUDIO_CONTEXT_WINDOW_TOKENS - out - STUDIO_SAFETY_MARGIN_TOKENS
+}
+
 const DEFAULT_STUDIO_CONFIG: StudioUserConfig = {
   chunkScanEngine: 'api',
   studioModelName: 'Gemini 2.5 Pro',
   studioMaxOutputTokens: 65536,
+  studioMaxInputTokens: null,
+  studioPageRecycleInterval: 5,
   studioWindowMinutes: 5,
   studioShortPartMinutes: 3,
   studioWindowOverlapSec: 0,
@@ -112,12 +144,28 @@ function recordKey(username: string): string {
 
 export async function loadStudioUserConfig(username: string): Promise<StudioUserConfig> {
   const raw = await readJSONRecord<Partial<StudioUserConfig>>(recordKey(username))
+  const studioMaxOutputTokens = Math.max(
+    1024,
+    Math.min(65536, Number(raw?.studioMaxOutputTokens) || DEFAULT_STUDIO_CONFIG.studioMaxOutputTokens),
+  )
+  const rawMaxInput = raw?.studioMaxInputTokens
+  const studioMaxInputTokens =
+    typeof rawMaxInput === 'number' && Number.isFinite(rawMaxInput) && rawMaxInput > 0
+      ? Math.max(50_000, Math.min(1_048_576, Math.floor(rawMaxInput)))
+      : null
+  const studioPageRecycleInterval = Math.max(
+    1,
+    Math.min(100, Math.floor(Number(raw?.studioPageRecycleInterval) || DEFAULT_STUDIO_CONFIG.studioPageRecycleInterval)),
+  )
+
   return {
     ...DEFAULT_STUDIO_CONFIG,
     ...(raw || {}),
     chunkScanEngine: raw?.chunkScanEngine === 'studio' ? 'studio' : 'api',
     studioModelName: (raw?.studioModelName || DEFAULT_STUDIO_CONFIG.studioModelName).trim() || DEFAULT_STUDIO_CONFIG.studioModelName,
-    studioMaxOutputTokens: Math.max(1024, Math.min(65536, Number(raw?.studioMaxOutputTokens) || DEFAULT_STUDIO_CONFIG.studioMaxOutputTokens)),
+    studioMaxOutputTokens,
+    studioMaxInputTokens,
+    studioPageRecycleInterval,
     studioWindowMinutes: Math.max(1, Math.min(15, Number(raw?.studioWindowMinutes) || DEFAULT_STUDIO_CONFIG.studioWindowMinutes)),
     studioShortPartMinutes: Math.max(1, Math.min(10, Number(raw?.studioShortPartMinutes) || DEFAULT_STUDIO_CONFIG.studioShortPartMinutes)),
     studioWindowOverlapSec: Math.max(0, Math.min(60, Number(raw?.studioWindowOverlapSec ?? DEFAULT_STUDIO_CONFIG.studioWindowOverlapSec))),
@@ -294,6 +342,12 @@ export async function getPublicStudioSettings(username: string): Promise<PublicS
     chunkScanEngine: cfg.chunkScanEngine,
     studioModelName: cfg.studioModelName,
     studioMaxOutputTokens: cfg.studioMaxOutputTokens,
+    studioMaxInputTokens: cfg.studioMaxInputTokens ?? null,
+    effectiveMaxInputTokens: computeEffectiveMaxInputTokens(
+      cfg.studioMaxOutputTokens,
+      cfg.studioMaxInputTokens,
+    ),
+    studioPageRecycleInterval: cfg.studioPageRecycleInterval ?? 5,
     studioWindowMinutes: cfg.studioWindowMinutes,
     studioShortPartMinutes: cfg.studioShortPartMinutes,
     studioWindowOverlapSec: cfg.studioWindowOverlapSec,

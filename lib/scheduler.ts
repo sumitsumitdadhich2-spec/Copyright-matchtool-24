@@ -65,7 +65,7 @@ import { applyGroupMatches, bestRejectedCandidate, groupMatchOrigin, originTag, 
 import { computeShortCoverage, coverageLine } from './short-coverage'
 import { globalGeminiCoordinator, CandidateLane } from './global-gemini-coordinator'
 import { globalChunkScanCoordinator, registerSchedulerChunkChecker } from './chunk-scan-coordinator'
-import { loadStudioUserConfig } from './studio-settings'
+import { computeEffectiveMaxInputTokens, loadStudioUserConfig } from './studio-settings'
 import {
   buildStudioScanPlan,
   clipMatchToShortSegment,
@@ -1688,7 +1688,7 @@ class Scheduler {
    * Replaces ONLY the transport of the chunk scan using Playwright + Google AI Studio:
    * - Plans <=3-min short parts × <=5-min contiguous movie blocks (from approved movieMinutes or full range)
    * - Runs strictly one job at a time (single browser, single account)
-   * - Shrinks movie block automatically if Studio token counter > 900K
+   * - Shrinks movie block automatically if Studio token counter > maxInputTokens (1_048_576 - maxOutputTokens - 5_000, or user override)
    * - Feeds raw answer text unchanged into parseChunkMatches, marks all covered 60s chunk indexes,
    *   and derives each match's chunkIndex = floor((movieStart - trimStart) / 60).
    */
@@ -1696,6 +1696,10 @@ class Scheduler {
     const { scan } = job
     const owner = scan.ownerUsername || 'admin'
     const studioCfg = await loadStudioUserConfig(owner)
+    const effectiveMaxInputTokens = computeEffectiveMaxInputTokens(
+      studioCfg.studioMaxOutputTokens,
+      studioCfg.studioMaxInputTokens,
+    )
     const stopScope = { scanId: scan.id, username: owner }
     studioController.clearStop(stopScope)
 
@@ -1750,7 +1754,7 @@ class Scheduler {
       addLog(
         scan,
         'info',
-        `Studio Window Planner: ${plannedJobs.length} window job(s) planned (short parts <= ${studioCfg.studioShortPartMinutes}m, movie blocks <= ${studioCfg.studioWindowMinutes}m, overlap ${studioCfg.studioWindowOverlapSec}s). Running strictly 1 at a time.`,
+        `Studio Window Planner: ${plannedJobs.length} window job(s) planned (short parts <= ${studioCfg.studioShortPartMinutes}m, movie blocks <= ${studioCfg.studioWindowMinutes}m, overlap ${studioCfg.studioWindowOverlapSec}s, maxInputTokens=${effectiveMaxInputTokens.toLocaleString()}). Running strictly 1 at a time.`,
       )
       this.mark(job)
 
@@ -1794,6 +1798,8 @@ class Scheduler {
             jobLabel,
             modelName: studioCfg.studioModelName,
             maxOutputTokens: studioCfg.studioMaxOutputTokens,
+            maxInputTokens: studioCfg.studioMaxInputTokens,
+            pageRecycleInterval: studioCfg.studioPageRecycleInterval,
             shortYoutubeUrl: scan.shortYoutubeUrl,
             shortDriveFileName: shortReady?.driveFileName || scan.shortDriveFileName,
             shortLocalPath: shortReady?.localPath || path.join(mediaDir, 'short.mp4'),
@@ -1810,6 +1816,7 @@ class Scheduler {
           })
 
           if (res.status === 'shrink_needed') {
+            const limitLabel = `${Math.round(res.maxInputTokens / 1000)}K [${res.maxInputTokens.toLocaleString()}]`
             const subBlocks =
               currentShrinkLevel < MAX_SHRINK_LEVELS
                 ? splitMovieBlockInHalf(scan, movieBlock, studioCfg.studioWindowOverlapSec || 0)
@@ -1833,13 +1840,13 @@ class Scheduler {
               addLog(
                 scan,
                 'warn',
-                `Studio token counter (${Math.round(res.tokenCount / 1000)}K > 900K, shrink level ${currentShrinkLevel + 1}/${MAX_SHRINK_LEVELS}) — split ${movieBlock.label} into ${subBlocks.map((b) => b.label).join(' & ')} and queued for immediate retry.`,
+                `Studio token counter (${Math.round(res.tokenCount / 1000)}K > ${limitLabel}, shrink level ${currentShrinkLevel + 1}/${MAX_SHRINK_LEVELS}) — split ${movieBlock.label} into ${subBlocks.map((b) => b.label).join(' & ')} and queued for immediate retry.`,
               )
               this.mark(job)
               continue
             } else {
               // FIX 4: Shrink dead-end — cannot split further (<=1 block or max shrink depth 3 reached)
-              const deadEndMsg = `token counter too high (${Math.round(res.tokenCount / 1000)}K > 900K) and block cannot be split (shrink level ${currentShrinkLevel}/${MAX_SHRINK_LEVELS})`
+              const deadEndMsg = `token counter too high (${Math.round(res.tokenCount / 1000)}K > ${limitLabel}) and block cannot be split (shrink level ${currentShrinkLevel}/${MAX_SHRINK_LEVELS})`
               for (const seg of coveredSegs) {
                 for (const ci of movieBlock.chunkIndexes) {
                   const ch = seg.chunks[ci]
@@ -1867,8 +1874,9 @@ class Scheduler {
 
           if (res.status === 'success') {
             completedCount++
-            // SMALL COSMETIC: Use real Studio token counter when available, and fallback to 1560 tokens/s (65 tok/frame * 24 fps)
-            const STUDIO_FALLBACK_RATE = 1560
+            // Item 4: Token-report fallback — when Studio counter is not readable, estimate with 1940 tokens/sec (calibrated: 930K / 480 s).
+            // The real counter always wins when readable.
+            const STUDIO_FALLBACK_RATE = 1940
             const totalVidDur = Math.max(1, shortPart.durationSec + movieBlock.durationSec)
             const promptTokens = 850
             const outputTokens = Math.round(res.rawText.length / 4)

@@ -134,10 +134,19 @@ export async function PUT(req: Request) {
 
   if (body.studio && typeof body.studio === 'object') {
     const st = body.studio as Record<string, unknown>
+    const parseMaxInput = (val: unknown): number | null => {
+      if (val === null || val === undefined || val === '' || val === 'auto' || Number(val) <= 0) return null
+      const n = Number(val)
+      return Number.isFinite(n) && n > 0 ? Math.max(50_000, Math.min(1_048_576, Math.floor(n))) : null
+    }
     await saveStudioUserConfig(session.username, {
       ...(st.chunkScanEngine !== undefined ? { chunkScanEngine: st.chunkScanEngine === 'studio' ? 'studio' : 'api' } : {}),
       ...(typeof st.studioModelName === 'string' ? { studioModelName: st.studioModelName.trim() } : {}),
       ...(st.studioMaxOutputTokens !== undefined ? { studioMaxOutputTokens: Number(st.studioMaxOutputTokens) } : {}),
+      ...(st.studioMaxInputTokens !== undefined ? { studioMaxInputTokens: parseMaxInput(st.studioMaxInputTokens) } : {}),
+      ...(st.studioPageRecycleInterval !== undefined
+        ? { studioPageRecycleInterval: Math.max(1, Math.min(100, Math.floor(Number(st.studioPageRecycleInterval) || 5))) }
+        : {}),
       ...(st.studioWindowMinutes !== undefined ? { studioWindowMinutes: Number(st.studioWindowMinutes) } : {}),
       ...(st.studioShortPartMinutes !== undefined ? { studioShortPartMinutes: Number(st.studioShortPartMinutes) } : {}),
       ...(st.studioWindowOverlapSec !== undefined ? { studioWindowOverlapSec: Number(st.studioWindowOverlapSec) } : {}),
@@ -204,10 +213,19 @@ export async function POST(req: Request) {
   }
   if (body.studio && typeof body.studio === 'object') {
     const st = body.studio as Record<string, unknown>
+    const parseMaxInput = (val: unknown): number | null => {
+      if (val === null || val === undefined || val === '' || val === 'auto' || Number(val) <= 0) return null
+      const n = Number(val)
+      return Number.isFinite(n) && n > 0 ? Math.max(50_000, Math.min(1_048_576, Math.floor(n))) : null
+    }
     await saveStudioUserConfig(username, {
       ...(st.chunkScanEngine !== undefined ? { chunkScanEngine: st.chunkScanEngine === 'studio' ? 'studio' : 'api' } : {}),
       ...(typeof st.studioModelName === 'string' ? { studioModelName: st.studioModelName.trim() } : {}),
       ...(st.studioMaxOutputTokens !== undefined ? { studioMaxOutputTokens: Number(st.studioMaxOutputTokens) } : {}),
+      ...(st.studioMaxInputTokens !== undefined ? { studioMaxInputTokens: parseMaxInput(st.studioMaxInputTokens) } : {}),
+      ...(st.studioPageRecycleInterval !== undefined
+        ? { studioPageRecycleInterval: Math.max(1, Math.min(100, Math.floor(Number(st.studioPageRecycleInterval) || 5))) }
+        : {}),
       ...(st.studioWindowMinutes !== undefined ? { studioWindowMinutes: Number(st.studioWindowMinutes) } : {}),
       ...(st.studioShortPartMinutes !== undefined ? { studioShortPartMinutes: Number(st.studioShortPartMinutes) } : {}),
       ...(st.studioWindowOverlapSec !== undefined ? { studioWindowOverlapSec: Number(st.studioWindowOverlapSec) } : {}),

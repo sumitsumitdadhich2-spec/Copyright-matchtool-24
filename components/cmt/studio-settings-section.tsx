@@ -24,6 +24,12 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   const [engine, setEngine] = useState<'api' | 'studio'>(studio?.chunkScanEngine ?? 'api')
   const [modelName, setModelName] = useState(studio?.studioModelName ?? 'Gemini 2.5 Pro')
   const [maxOutputTokens, setMaxOutputTokens] = useState(studio?.studioMaxOutputTokens ?? 65536)
+  const [maxInputTokensStr, setMaxInputTokensStr] = useState<string>(
+    studio?.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '',
+  )
+  const [pageRecycleInterval, setPageRecycleInterval] = useState<number>(
+    studio?.studioPageRecycleInterval ?? 5,
+  )
   const [windowMinutes, setWindowMinutes] = useState(studio?.studioWindowMinutes ?? 5)
   const [shortPartMinutes, setShortPartMinutes] = useState(studio?.studioShortPartMinutes ?? 3)
   const [windowOverlapSec, setWindowOverlapSec] = useState(studio?.studioWindowOverlapSec ?? 0)
@@ -50,6 +56,8 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     setEngine(studio.chunkScanEngine)
     setModelName(studio.studioModelName)
     setMaxOutputTokens(studio.studioMaxOutputTokens)
+    setMaxInputTokensStr(studio.studioMaxInputTokens ? String(studio.studioMaxInputTokens) : '')
+    setPageRecycleInterval(studio.studioPageRecycleInterval ?? 5)
     setWindowMinutes(studio.studioWindowMinutes)
     setShortPartMinutes(studio.studioShortPartMinutes)
     setWindowOverlapSec(studio.studioWindowOverlapSec)
@@ -58,6 +66,8 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
     studio?.chunkScanEngine,
     studio?.studioModelName,
     studio?.studioMaxOutputTokens,
+    studio?.studioMaxInputTokens,
+    studio?.studioPageRecycleInterval,
     studio?.studioWindowMinutes,
     studio?.studioShortPartMinutes,
     studio?.studioWindowOverlapSec,
@@ -93,6 +103,11 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
   async function saveStudioParams() {
     setSavingConfig(true)
     setError(null)
+    const trimmedMaxInput = maxInputTokensStr.trim()
+    const parsedMaxInput =
+      trimmedMaxInput === '' || trimmedMaxInput.toLowerCase() === 'auto'
+        ? null
+        : Number(trimmedMaxInput)
     const res = await fetch('/api/settings', {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
@@ -101,6 +116,11 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
           chunkScanEngine: engine,
           studioModelName: modelName,
           studioMaxOutputTokens: Number(maxOutputTokens),
+          studioMaxInputTokens:
+            parsedMaxInput !== null && Number.isFinite(parsedMaxInput) && parsedMaxInput > 0
+              ? Math.floor(parsedMaxInput)
+              : null,
+          studioPageRecycleInterval: Math.max(1, Math.min(100, Math.floor(Number(pageRecycleInterval) || 5))),
           studioWindowMinutes: Number(windowMinutes),
           studioShortPartMinutes: Number(shortPartMinutes),
           studioWindowOverlapSec: Number(windowOverlapSec),
@@ -466,6 +486,19 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
             </label>
 
             <label className="space-y-1 text-xs">
+              <span className="text-muted-foreground">
+                Max input tokens (auto = {(1_048_576 - (Number(maxOutputTokens) || 65536) - 5_000).toLocaleString()})
+              </span>
+              <input
+                type="text"
+                value={maxInputTokensStr}
+                onChange={(e) => setMaxInputTokensStr(e.target.value)}
+                placeholder={`auto (${1_048_576 - (Number(maxOutputTokens) || 65536) - 5_000})`}
+                className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+
+            <label className="space-y-1 text-xs">
               <span className="text-muted-foreground">Window minutes (default 5)</span>
               <input
                 type="number"
@@ -497,6 +530,18 @@ export function StudioSettingsSection({ studio, onRefresh }: Props) {
                 max={60}
                 value={windowOverlapSec}
                 onChange={(e) => setWindowOverlapSec(Number(e.target.value))}
+                className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
+              />
+            </label>
+
+            <label className="space-y-1 text-xs">
+              <span className="text-muted-foreground">Page recycle interval (jobs, default 5)</span>
+              <input
+                type="number"
+                min={1}
+                max={100}
+                value={pageRecycleInterval}
+                onChange={(e) => setPageRecycleInterval(Number(e.target.value))}
                 className="w-full rounded-md border border-input bg-background px-2.5 py-1.5 font-mono text-xs outline-none focus:ring-2 focus:ring-ring"
               />
             </label>

@@ -34,7 +34,7 @@ export interface StudioScanJobPlan {
   jobIndex: number
   shortPart: StudioShortPart
   movieBlock: StudioMovieBlock
-  /** Number of times this job's movieBlock has been split due to >900K tokens (max 3) */
+  /** Number of times this job's movieBlock has been split due to exceeding maxInputTokens (max 3) */
   shrinkLevel?: number
 }
 
@@ -309,7 +309,7 @@ export function buildMovieBlocksForShortPart(
 }
 
 /**
- * Split a movie block in half when AI Studio's token counter exceeds ~900K tokens.
+ * Split a movie block in half when AI Studio's token counter exceeds the maxInputTokens limit.
  */
 export function splitMovieBlockInHalf(
   scan: Scan,

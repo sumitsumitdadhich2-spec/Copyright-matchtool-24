@@ -29,6 +29,22 @@ interface StudioStepLog {
   level: 'info' | 'success' | 'warn' | 'error'
 }
 
+interface StudioTestClipLine {
+  label: string
+  pass: boolean
+  expected: string
+  actual: string
+  detail?: string
+}
+
+interface StudioTestClipResult {
+  status: 'idle' | 'running' | 'pass' | 'fail' | 'error'
+  summary: string
+  lines: StudioTestClipLine[]
+  startedAt: number
+  finishedAt?: number
+}
+
 interface StudioLiveSnapshot {
   active: boolean
   paused: boolean
@@ -43,6 +59,7 @@ interface StudioLiveSnapshot {
   screenshotAt: number | null
   viewport: { width: number; height: number }
   logs: StudioStepLog[]
+  testClipResult?: StudioTestClipResult | null
 }
 
 export function StudioLivePanel({ scan }: { scan: Scan | null }) {
@@ -158,7 +175,7 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
         setQuickCookieText('')
         setQuickCookieOpen(false)
       } else if (label === 'run_test_window') {
-        setActionToast('Started 1-Video Studio Chunk Test (10s short + 30s movie @ 24fps)! Watch live viewport below.')
+        setActionToast('Started test clip run (TEST_short.mp4 0-55s + TEST_movie_360p.mp4 0-420s)! Watch live viewport below.')
       } else if (label === 'test_login') {
         setActionToast(
           data.loggedIn
@@ -331,14 +348,14 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
             onClick={() => sendControl({ action: 'run_test_window' }, 'run_test_window')}
             disabled={busyAction !== null || Boolean(snap?.active)}
             className="h-7 px-2.5 text-[11px] gap-1 border-emerald-500/40 text-emerald-300 hover:bg-emerald-500/10"
-            title="Generate 10s Short + 30s Movie test clips and run a real Studio window scan"
+            title="Run test-data/TEST_short.mp4 (0-55s) + TEST_movie_360p.mp4 (0-420s) and verify against TEST_expected.json (±0.15s)"
           >
             {busyAction === 'run_test_window' ? (
               <Loader2 className="h-3 w-3 animate-spin" />
             ) : (
               <Play className="h-3 w-3" />
             )}
-            Test 1-Video Chunk
+            Run test clip
           </Button>
 
           <Button
@@ -428,6 +445,78 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
           >
             Dismiss
           </button>
+        </div>
+      )}
+
+      {snap?.testClipResult && (
+        <div
+          className={cn(
+            'border-b border-border px-4 py-2.5 flex flex-col gap-1.5 text-[11px]',
+            snap.testClipResult.status === 'pass'
+              ? 'bg-emerald-500/10'
+              : snap.testClipResult.status === 'running'
+                ? 'bg-sky-500/10'
+                : 'bg-destructive/10',
+          )}
+        >
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="flex items-center gap-2 font-semibold">
+              {snap.testClipResult.status === 'pass' ? (
+                <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
+              ) : snap.testClipResult.status === 'running' ? (
+                <Loader2 className="h-3.5 w-3.5 text-sky-400 animate-spin" />
+              ) : (
+                <AlertCircle className="h-3.5 w-3.5 text-destructive" />
+              )}
+              <span
+                className={cn(
+                  snap.testClipResult.status === 'pass'
+                    ? 'text-emerald-300'
+                    : snap.testClipResult.status === 'running'
+                      ? 'text-sky-300'
+                      : 'text-destructive',
+                )}
+              >
+                Test Clip Result: {snap.testClipResult.summary}
+              </span>
+            </div>
+            <span className="font-mono text-[10px] text-muted-foreground">
+              {new Date(snap.testClipResult.finishedAt || snap.testClipResult.startedAt).toLocaleTimeString()}
+            </span>
+          </div>
+
+          {snap.testClipResult.lines.length > 0 && (
+            <div className="grid grid-cols-1 gap-1 pt-1">
+              {snap.testClipResult.lines.map((line, idx) => (
+                <div
+                  key={`${line.label}-${idx}`}
+                  className="flex flex-wrap items-center justify-between gap-2 rounded bg-background/60 px-2.5 py-1 font-mono text-[10px] border border-border/60"
+                >
+                  <div className="flex items-center gap-2">
+                    <span
+                      className={cn(
+                        'rounded px-1.5 py-0.5 font-bold',
+                        line.pass
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'bg-destructive/20 text-destructive',
+                      )}
+                    >
+                      {line.pass ? 'PASS' : 'FAIL'}
+                    </span>
+                    <span className="text-muted-foreground">Expected:</span>
+                    <span className="text-foreground">{line.expected}</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-muted-foreground">Got:</span>
+                    <span className="text-foreground">{line.actual}</span>
+                    {line.detail && (
+                      <span className="text-muted-foreground">({line.detail})</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 

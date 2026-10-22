@@ -10,6 +10,8 @@ docs
 *.mkv
 *.mov
 *.webm
+!test-data/
+!test-data/**
 .v0-trash
 .vercel
 __v0_*

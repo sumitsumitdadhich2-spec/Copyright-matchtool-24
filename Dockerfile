@@ -79,6 +79,7 @@ WORKDIR /app
 RUN groupadd -g 1001 cmt && useradd -u 1001 -g cmt -m cmt
 
 COPY --from=build --chown=cmt:cmt /app/public ./public
+COPY --from=build --chown=cmt:cmt /app/test-data ./test-data
 COPY --from=build --chown=cmt:cmt /app/.next/standalone ./
 COPY --from=build --chown=cmt:cmt /app/.next/static ./.next/static
 # Lifts Node's 5-minute request-body timeout so a single-stream multi-GB video

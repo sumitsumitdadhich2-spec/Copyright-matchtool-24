@@ -8,6 +8,7 @@ import {
   findFirstVisibleLocator,
 } from './studio-selectors'
 import {
+  computeEffectiveMaxInputTokens,
   loadDecryptedPlaywrightCookies,
   loadStudioUserConfig,
   saveStudioUserConfig,
@@ -24,6 +25,22 @@ export interface StudioStepLog {
   level: 'info' | 'success' | 'warn' | 'error'
 }
 
+export interface StudioTestClipLine {
+  label: string
+  pass: boolean
+  expected: string
+  actual: string
+  detail?: string
+}
+
+export interface StudioTestClipResult {
+  status: 'running' | 'pass' | 'fail' | 'error'
+  summary: string
+  lines: StudioTestClipLine[]
+  startedAt: number
+  finishedAt?: number
+}
+
 export interface StudioLiveSnapshot {
   active: boolean
   paused: boolean
@@ -38,6 +55,7 @@ export interface StudioLiveSnapshot {
   screenshotAt: number | null
   viewport: { width: number; height: number }
   logs: StudioStepLog[]
+  testClipResult?: StudioTestClipResult | null
 }
 
 const VIEWPORT = { width: 1366, height: 840 }
@@ -61,6 +79,8 @@ class StudioBrowserController {
   private screenshotInFlight: Promise<void> | null = null
   private logs: StudioStepLog[] = []
   private lastInjectedCookieUser: string | null = null
+  private finishedJobsSinceRecycle = 0
+  private testClipResult: StudioTestClipResult | null = null
   private jobLockBusy = false
   private jobLockQueue: Array<{
     scanId: string
@@ -288,6 +308,56 @@ class StudioBrowserController {
     }
   }
 
+  public setTestClipResult(result: StudioTestClipResult | null) {
+    this.testClipResult = result
+  }
+
+  public getTestClipResult(): StudioTestClipResult | null {
+    return this.testClipResult
+  }
+
+  /**
+   * Item 5: Page recycling — after every N finished window jobs (success or failed, default 5),
+   * close the Playwright page and open a fresh page in the SAME persistent context (cookies kept),
+   * then continue. Logs "page recycled" in the step log.
+   */
+  public async recordFinishedWindowJobAndMaybeRecyclePage(
+    username: string,
+    recycleInterval?: number,
+    onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void,
+  ): Promise<void> {
+    this.finishedJobsSinceRecycle += 1
+    let interval = recycleInterval
+    if (!interval || interval < 1) {
+      const cfg = await loadStudioUserConfig(username)
+      interval = cfg.studioPageRecycleInterval || 5
+    }
+    if (this.finishedJobsSinceRecycle < interval) return
+
+    const count = this.finishedJobsSinceRecycle
+    this.finishedJobsSinceRecycle = 0
+    if (!this.context) return
+
+    try {
+      const oldPage = this.page
+      const freshPage = await this.context.newPage()
+      await freshPage.setViewportSize(VIEWPORT)
+      this.page = freshPage
+      if (oldPage && !oldPage.isClosed()) {
+        await oldPage.close().catch(() => {})
+      }
+      const detail = `Closed old page and opened fresh page in same persistent context after ${count} finished window job(s) (interval=${interval})`
+      this.logStep('page recycled', detail, 'info')
+      onLog?.('info', `[Studio] page recycled: ${detail}`)
+    } catch (err) {
+      this.logStep(
+        'page recycle warning',
+        err instanceof Error ? err.message : String(err),
+        'warn',
+      )
+    }
+  }
+
   /**
    * FIX 6: Capture at most ONE screenshot per second TOTAL across all connected SSE clients.
    */
@@ -332,6 +402,7 @@ class StudioBrowserController {
       screenshotAt: this.lastScreenshotAt,
       viewport: VIEWPORT,
       logs: this.logs.slice(-30),
+      testClipResult: this.testClipResult,
     }
   }
 
@@ -1028,10 +1099,14 @@ class StudioBrowserController {
    * Execute a single (shortPart, movieBlock) Studio job:
    * a. Open a NEW chat on aistudio.google.com
    * b. Select model, temperature=0, thinking=High, maxOutputTokens, safety=OFF, mediaRes=Low
-   * c. Attach Video 1 (short part) & Video 2 (movie_360p from Drive), set start/end times + FPS=24 (verified read-back)
-   * d. Read token counter -> if > 900K, signal caller to shrink movie block and retry; if implausibly low (~1fps), throw
-   * e. Paste prompt and run -> wait up to 15m -> require Stop hidden + Run enabled + 6s stable answer
+   * c. Attach Video 1 (short part) & Video 2 (movie_360p), set start/end times + FPS=24 (verified read-back)
+   * d. Paste prompt text and check token counter BEFORE pressing Run:
+   *    - If > maxInputTokens (1_048_576 - maxOutputTokens - 5_000, or user override), signal shrink_needed
+   *    - Never run the shrink check after pressing Run (during generation the counter can include output tokens)
+   *    - Keep the implausibly low token counter check (minimum 500 tokens/sec of video)
+   * e. Press Run -> wait up to 15m -> require Stop hidden + Run enabled + 6s stable answer
    * f. Copy final answer text only (no thoughts) -> calibrate offset mode -> parseChunkMatches
+   * g. Recycle Playwright page in same persistent context after every N finished window jobs (default 5)
    */
   public async runWindowJob(params: {
     username: string
@@ -1039,6 +1114,8 @@ class StudioBrowserController {
     jobLabel: string
     modelName: string
     maxOutputTokens: number
+    maxInputTokens?: number | null
+    pageRecycleInterval?: number
     shortYoutubeUrl?: string | null
     shortDriveFileName?: string | null
     shortLocalPath?: string | null
@@ -1051,7 +1128,7 @@ class StudioBrowserController {
     sanitized?: boolean
     onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void
   }): Promise<
-    | { status: 'shrink_needed'; tokenCount: number }
+    | { status: 'shrink_needed'; tokenCount: number; maxInputTokens: number }
     | {
         status: 'success'
         rawText: string
@@ -1080,17 +1157,26 @@ class StudioBrowserController {
       onLog,
     } = params
 
+    const userCfg = await loadStudioUserConfig(username)
+    const effectiveMaxInputTokens = computeEffectiveMaxInputTokens(
+      maxOutputTokens,
+      params.maxInputTokens !== undefined ? params.maxInputTokens : userCfg.studioMaxInputTokens,
+    )
+    const effectiveRecycleInterval =
+      params.pageRecycleInterval ?? userCfg.studioPageRecycleInterval ?? 5
+
     const scope = { scanId, username }
     this.setJobContext(scanId, jobLabel, username)
-    const page = await this.ensurePage(username)
 
     const totalVideoSec = Math.max(1, (shortEndSec - shortStartSec) + (movieEndSec - movieStartSec))
-    // At 24 FPS (~1560 tokens/s at Low media resolution), total tokens must be far above a ~1 FPS result (~65-260 tok/s).
+    // Item 3: KEEP the "implausibly low token counter" check (minimum 500 tokens/sec of video).
+    // Real rate for 24 fps is about 1940 tokens/sec (930K for 480 s).
     const minPlausible24FpsTokens = Math.round(totalVideoSec * 500)
 
     const MAX_ATTEMPTS = 3
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       await this.waitIfPausedOrThrowIfStopped(scope)
+      const page = await this.ensurePage(username)
 
       try {
         // (a) Open a NEW chat on aistudio.google.com
@@ -1111,7 +1197,7 @@ class StudioBrowserController {
         // (b) Configure model, temperature 0, thinking High, max output tokens, safety OFF
         await this.configureRunSettings(page, { modelName, maxOutputTokens }, scope)
 
-        // (c) Attach Video 1 = short part & Video 2 = movie_360p from Drive, set start/end & 24 FPS
+        // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS
         await this.attachVideoAndConfigureRange(page, {
           label: 'short',
           youtubeUrl: shortYoutubeUrl,
@@ -1133,19 +1219,7 @@ class StudioBrowserController {
           scope,
         })
 
-        // Wait briefly for AI Studio to finish counting media tokens
-        await new Promise((r) => setTimeout(r, 3500))
-
-        // (d) Read Studio's token counter. If > ~900K: shrink the movie block and retry.
-        let tokens = await this.readStudioTokenCount(page)
-        if (tokens !== null && tokens > 900_000) {
-          const msg = `Studio token counter is ${(tokens / 1000).toFixed(0)}K (> 900K limit) for ${jobLabel} — shrinking movie block and retrying`
-          this.logStep('shrinking block', msg, 'warn')
-          onLog?.('warn', msg)
-          return { status: 'shrink_needed', tokenCount: tokens }
-        }
-
-        // (e) Paste the chunk prompt and run
+        // (d) Paste the chunk prompt text BEFORE reading the input token counter and BEFORE pressing Run
         const promptText = buildStudioChunkPrompt({
           movieWindowSec: movieEndSec - movieStartSec,
           shortPartSec: shortEndSec - shortStartSec,
@@ -1158,8 +1232,41 @@ class StudioBrowserController {
         }
         await promptInput.click()
         await promptInput.fill(promptText)
-        await new Promise((r) => setTimeout(r, 400))
 
+        // Wait for AI Studio to finish counting tokens for both attached videos + pasted prompt text
+        let tokens: number | null = null
+        const tokenWaitDeadline = Date.now() + 8_000
+        while (Date.now() < tokenWaitDeadline) {
+          await new Promise((r) => setTimeout(r, 700))
+          const readVal = await this.readStudioTokenCount(page)
+          if (readVal !== null) {
+            tokens = readVal
+            if (tokens >= minPlausible24FpsTokens) break
+          }
+        }
+
+        // Item 1 & Item 2: Do the token-limit shrink check BEFORE pressing Run
+        // (after both videos are attached and the prompt text is pasted).
+        // Never run the shrink check after the run started!
+        if (tokens !== null && tokens > effectiveMaxInputTokens) {
+          const msg = `Studio token counter is ${(tokens / 1000).toFixed(0)}K (> ${(effectiveMaxInputTokens / 1000).toFixed(0)}K limit [${effectiveMaxInputTokens.toLocaleString()}]) for ${jobLabel} — shrinking movie block and retrying`
+          this.logStep('shrinking block', msg, 'warn')
+          onLog?.('warn', msg)
+          return {
+            status: 'shrink_needed',
+            tokenCount: tokens,
+            maxInputTokens: effectiveMaxInputTokens,
+          }
+        }
+
+        // Item 3: Check implausibly low token counter (minimum 500 tokens/sec of video) before pressing Run if readable
+        if (tokens !== null && tokens < minPlausible24FpsTokens) {
+          throw new Error(
+            `FPS/range not applied: token counter (${tokens}) is implausibly low for ${totalVideoSec.toFixed(0)}s at 24 FPS (expected >= ${minPlausible24FpsTokens})`,
+          )
+        }
+
+        // (e) Press Run
         const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
         if (runBtn) {
           await runBtn.click()
@@ -1167,17 +1274,14 @@ class StudioBrowserController {
           await promptInput.press('Control+Enter')
         }
 
-        // FIX 1d: Verify after the run starts that the token counter is plausible for 24 FPS (far above ~1 fps)
-        await new Promise((r) => setTimeout(r, 2000))
-        const postStartTokens = await this.readStudioTokenCount(page)
-        if (postStartTokens !== null) {
-          tokens = postStartTokens
-        }
-        if (tokens !== null && tokens > 900_000) {
-          const msg = `Studio token counter is ${(tokens / 1000).toFixed(0)}K (> 900K limit) for ${jobLabel} — shrinking movie block and retrying`
-          this.logStep('shrinking block', msg, 'warn')
-          onLog?.('warn', msg)
-          return { status: 'shrink_needed', tokenCount: tokens }
+        // If the token counter was not yet readable before Run, read once right after Run starts
+        // strictly for the implausibly-low check (NEVER for the shrink check).
+        if (tokens === null) {
+          await new Promise((r) => setTimeout(r, 2000))
+          const postStartTokens = await this.readStudioTokenCount(page)
+          if (postStartTokens !== null) {
+            tokens = postStartTokens
+          }
         }
         if (tokens === null || tokens < minPlausible24FpsTokens) {
           throw new Error(
@@ -1275,7 +1379,7 @@ class StudioBrowserController {
 
         this.logStep('answer copied', `${rawAnswer.length} chars extracted (6s stable, thoughts excluded)`, 'success')
 
-        // (f) & (g) Calibrate offset mode (relative 0:00 vs absolute startSec) and parse via parseChunkMatches!
+        // (f) Calibrate offset mode (relative 0:00 vs absolute startSec) and parse via parseChunkMatches!
         const calibrated = await this.calibrateAndParseMatches({
           username,
           rawText: rawAnswer,
@@ -1287,8 +1391,16 @@ class StudioBrowserController {
           onLog,
         })
 
-        // SMALL COSMETIC: Use real Studio token counter when available, else fallback to 1560 tokens/s (65 tok/frame * 24 fps)
-        const fallbackTokens24Fps = Math.round(totalVideoSec * 1560)
+        // Item 5: Page recycling after every N finished window jobs (success or failed)
+        await this.recordFinishedWindowJobAndMaybeRecyclePage(
+          username,
+          effectiveRecycleInterval,
+          onLog,
+        )
+
+        // Item 4: Token-report fallback — when Studio counter is not readable, estimate with 1940 tokens/sec (calibrated: 930K / 480 s).
+        // The real counter always wins when readable.
+        const fallbackTokens24Fps = Math.round(totalVideoSec * 1940)
         return {
           status: 'success',
           rawText: rawAnswer,
@@ -1301,6 +1413,11 @@ class StudioBrowserController {
         const msg = err instanceof Error ? err.message : String(err)
         const isPolicy = /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
         if (isPolicy && sanitized) {
+          await this.recordFinishedWindowJobAndMaybeRecyclePage(
+            username,
+            effectiveRecycleInterval,
+            onLog,
+          )
           throw new Error(`POLICY_BLOCKED: ${msg}`)
         }
         const backoffSec = attempt * 15
@@ -1311,6 +1428,12 @@ class StudioBrowserController {
         )
         onLog?.('warn', `Studio job ${jobLabel} attempt ${attempt}/${MAX_ATTEMPTS} error: ${msg} — retrying in ${backoffSec}s...`)
         if (attempt >= MAX_ATTEMPTS) {
+          // Item 5: Count failed window job toward page recycle interval too
+          await this.recordFinishedWindowJobAndMaybeRecyclePage(
+            username,
+            effectiveRecycleInterval,
+            onLog,
+          )
           throw err
         }
         await new Promise((r) => setTimeout(r, backoffSec * 1000))

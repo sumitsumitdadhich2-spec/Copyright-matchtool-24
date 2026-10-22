@@ -19,6 +19,8 @@ uploads/
 *.mov
 *.mkv
 *.webm
+!test-data/
+!test-data/**
 
 # Runtime data written by the app in local dev (DATA_DIR defaults to ./data).
 # Scan records, uploaded videos and in-progress .part/.meta upload files must

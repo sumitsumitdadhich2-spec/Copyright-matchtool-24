@@ -1,0 +1,16 @@
+{
+  "description": "Ground truth for TEST_short.mp4 inside TEST_movie_360p.mp4 (both 640x360, 24 fps). Times are exact frame boundaries.",
+  "short_duration_sec": 55.0,
+  "movie_duration_sec": 420.0,
+  "tolerance_sec": 0.15,
+  "matches": [
+    { "short": "00:00.000 - 00:15.000", "movie": "00:05:12.500 - 00:05:27.500", "speed": 1.0, "note": "movie window 2 (05:00-07:00); crosses scene 16/17 cut at 05:20" },
+    { "short": "00:15.000 - 00:35.000", "movie": "00:01:07.250 - 00:01:27.250", "speed": 1.0, "note": "movie window 1; colour graded + brighter; crosses scene 4/5 cut at 01:20" },
+    { "short": "00:35.000 - 00:50.000", "movie": "00:03:41.000 - 00:03:56.000", "speed": 1.0, "note": "movie window 1; no scene cut inside" }
+  ],
+  "not_found": [
+    { "short": "00:50.000 - 00:55.000", "note": "black TITLE CARD, not from the movie" }
+  ],
+  "alterations_in_short": ["watermark '@testshorts' bottom-right on all clips", "clip 2 brighter and more saturated", "clips are out of movie order"],
+  "how_to_verify": "Every movie frame shows its own timecode (HH:MM:SS.mmm) and a scene number (SCENE 01-21, with N white squares = scene N). The short frames show the same movie timecode, so the match can be read by eye."
+}
