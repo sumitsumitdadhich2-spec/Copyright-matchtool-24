@@ -31,3 +31,5 @@ data/work/
 data/auth/
 data/counters.json
 data/settings.json
+data/studio-chrome-profile/
+data/studio-chromium-profile/
