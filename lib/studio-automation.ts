@@ -81,6 +81,7 @@ class StudioBrowserController {
   private screenshotInFlight: Promise<void> | null = null
   private logs: StudioStepLog[] = []
   private lastInjectedCookieUser: string | null = null
+  private browserLaunchInfo: string | null = null
   private finishedJobsSinceRecycle = 0
   private testClipResult: StudioTestClipResult | null = null
   private jobLockBusy = false
@@ -238,7 +239,7 @@ class StudioBrowserController {
     }
   }
 
-  public async ensurePage(username: string, _forceReloadCookies = false): Promise<Page> {
+  public async ensurePage(username: string): Promise<Page> {
     if (this.page && !this.page.isClosed() && this.context) {
       await this.context
         .grantPermissions(['clipboard-read', 'clipboard-write'], {
@@ -246,6 +247,14 @@ class StudioBrowserController {
         })
         .catch(() => {})
       this.lastInjectedCookieUser = username
+      if (!this.browserLaunchInfo) {
+        const pwPath = chromium.executablePath()
+        const sysChrome = ['/usr/bin/google-chrome', '/usr/bin/google-chrome-stable', '/usr/bin/chromium'].find((p) =>
+          fs.existsSync(p),
+        )
+        const displayEnv = process.env.DISPLAY || ''
+        this.browserLaunchInfo = `binary=${sysChrome || pwPath} · mode=${displayEnv ? 'headed' : 'headless (no DISPLAY)'}`
+      }
       return this.page
     }
 
@@ -274,12 +283,21 @@ class StudioBrowserController {
           '--window-size=1366,840',
         ]
 
-        // Launch headed real Chrome (channel: 'chrome', headless: false) with persistent user-data-dir.
-        // Do NOT inject cookies here — the user logs in once in the persistent profile.
+        const sysChromePath = [
+          '/usr/bin/google-chrome',
+          '/usr/bin/google-chrome-stable',
+          '/usr/bin/google-chrome-beta',
+          '/usr/bin/chromium',
+          '/usr/bin/chromium-browser',
+        ].find((p) => fs.existsSync(p))
+        const pwExecPath = chromium.executablePath()
+        const displayEnv = process.env.DISPLAY || ''
+
         this.logStep(
           'browser launching',
-          'Starting headed real Chrome (channel: chrome) with persistent user-data-dir',
+          `Checking Chrome/Chromium (systemChrome=${sysChromePath || 'none'}, playwrightChromium=${pwExecPath}, DISPLAY=${displayEnv || 'none'})`,
         )
+
         try {
           this.context = await chromium.launchPersistentContext(profileDir, {
             headless: false,
@@ -287,25 +305,28 @@ class StudioBrowserController {
             viewport: VIEWPORT,
             args: baseArgs,
           })
+          this.browserLaunchInfo = `channel=chrome · path=${sysChromePath || 'system-chrome'} · mode=headed · profile=${profileDir}`
+          this.logStep('browser launched', this.browserLaunchInfo, 'success')
         } catch (chromeErr) {
-          // Fallback if system 'chrome' channel or X server is unavailable in container
+          const chromeErrMsg = chromeErr instanceof Error ? chromeErr.message.split('\n')[0].slice(0, 120) : String(chromeErr)
           try {
             this.context = await chromium.launchPersistentContext(profileDir, {
               headless: false,
               viewport: VIEWPORT,
               args: baseArgs,
             })
-          } catch {
-            this.logStep(
-              'browser fallback',
-              `Headed Chrome launch unavailable (${chromeErr instanceof Error ? chromeErr.message.slice(0, 80) : 'no display'}), using persistent profile context`,
-              'warn',
-            )
+            this.browserLaunchInfo = `chromium · path=${pwExecPath} · mode=headed · profile=${profileDir}`
+            this.logStep('browser launched', this.browserLaunchInfo, 'success')
+          } catch (headedErr) {
+            const headedErrMsg =
+              headedErr instanceof Error ? headedErr.message.split('\n')[0].slice(0, 120) : String(headedErr)
             this.context = await chromium.launchPersistentContext(profileDir, {
               headless: true,
               viewport: VIEWPORT,
               args: baseArgs,
             })
+            this.browserLaunchInfo = `chromium · path=${pwExecPath} · mode=headless (headed unavailable: ${chromeErrMsg} / ${headedErrMsg}) · profile=${profileDir}`
+            this.logStep('browser launched', this.browserLaunchInfo, 'warn')
           }
         }
 
@@ -349,7 +370,6 @@ class StudioBrowserController {
         const encrypted = encryptSecret(JSON.stringify(cookiesToSave))
         await saveStudioUserConfig(username, {
           encryptedCookies: encrypted,
-          cookiesUpdatedAt: Date.now(),
         })
       }
     } catch {
@@ -526,7 +546,7 @@ class StudioBrowserController {
     currentUrl: string
     message: string
   }> {
-    const page = await this.ensurePage(username, true)
+    const page = await this.ensurePage(username)
     this.logStep('testing login', 'Opening aistudio.google.com/prompts/new_chat...')
 
     try {
@@ -1818,9 +1838,6 @@ class StudioBrowserController {
     const { label, youtubeUrl, driveFileName, localFilePath, startSec, endSec, fps, scope } = params
     await this.waitIfPausedOrThrowIfStopped(scope)
 
-    // Ensure Run Settings panel is closed before interacting with the prompt box / + button / chips
-    await this.closeRunSettingsPanel(page)
-
     const uploadedBasename =
       driveFileName ||
       (localFilePath ? path.basename(localFilePath) : '') ||
@@ -2791,11 +2808,17 @@ class StudioBrowserController {
     let activeModelName = modelName || MODEL_FALLBACK_CHAIN[0]
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      let currentStage = 'setup/ensure_page'
       await this.waitIfPausedOrThrowIfStopped(scope)
-      const page = await this.ensurePage(username)
 
       try {
+        const page = await this.ensurePage(username)
+        if (this.browserLaunchInfo && attempt === 1) {
+          this.logStep('browser info', this.browserLaunchInfo, 'info')
+        }
+
         // (a) Open a NEW chat on aistudio.google.com
+        currentStage = 'setup/new_chat'
         this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
         await page.goto(STUDIO_URLS.newChat, {
           waitUntil: 'domcontentloaded',
@@ -2810,10 +2833,12 @@ class StudioBrowserController {
           )
         }
 
-        // (b) Configure Run Settings (panel is already open in new chat: wait for elements, select model/fallback model, set Thinking=High)
+        // (b) Configure Run Settings (panel is already open in new chat: wait for elements, select model/fallback model, set Thinking=High; leave panel open)
+        currentStage = 'setup/run_settings'
         await this.configureRunSettings(page, { modelName: activeModelName, maxOutputTokens }, scope)
 
         // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (waits 10s after each Save)
+        currentStage = 'setup/attach_short'
         await this.attachVideoAndConfigureRange(page, {
           label: 'short',
           youtubeUrl: shortYoutubeUrl,
@@ -2825,6 +2850,7 @@ class StudioBrowserController {
           scope,
         })
 
+        currentStage = 'setup/attach_movie'
         await this.attachVideoAndConfigureRange(page, {
           label: 'movie',
           driveFileName: movieDriveFileName,
@@ -2836,6 +2862,7 @@ class StudioBrowserController {
         })
 
         // (d) Paste the chunk prompt text BEFORE reading the input token counter and BEFORE pressing Run
+        currentStage = 'setup/prompt_paste'
         const promptText = buildStudioChunkPrompt({
           movieWindowSec: movieEndSec - movieStartSec,
           shortPartSec: shortEndSec - shortStartSec,
@@ -2852,6 +2879,7 @@ class StudioBrowserController {
         // Wait up to 60 s for AI Studio to finish counting tokens for both attached videos + pasted prompt text:
         // poll every 1 s, log each reading in the step log, and accept the value only when
         // it is >= minPlausible24FpsTokens AND unchanged for 3 consecutive reads (counter settled).
+        currentStage = 'setup/token_poll'
         let tokens: number | null = null
         let settledTokens: number | null = null
         let lastReadTokens: number | null = null
@@ -2920,6 +2948,7 @@ class StudioBrowserController {
         // Wait 10 seconds after the prompt is pasted and the token counter has settled, then press Run
         await new Promise((r) => setTimeout(r, 10_000))
 
+        currentStage = 'run/execute'
         // Attach network response listener BEFORE pressing Run so we capture exact GenerateContent status + body on 403/errors
         let capturedRunError: { status: number; url: string; body: string } | null = null
         const onRunResponse = async (res: PlaywrightResponse) => {
@@ -2931,14 +2960,14 @@ class StudioBrowserController {
                 url,
               )
             if (!isGenApi && status < 400) return
-            if (status >= 400 || /GenerateContent|MakerSuiteService|alkali/i.test(url)) {
+            if (status >= 400 || /GenerateContent|MakerSuiteService|alkali|batchexecute/i.test(url)) {
               const text = await res.text().catch(() => '')
               if (
                 status >= 400 ||
                 /PERMISSION_DENIED|caller does not have permission|"error"\s*:/i.test(text)
               ) {
                 const compactBody = text.replace(/\s+/g, ' ').trim().slice(0, 600)
-                capturedRunError = { status, url, body: compactBody }
+                capturedRunError = { status, url, body: compactBody || `HTTP ${status} (${url.slice(0, 120)})` }
               }
             }
           } catch {
@@ -2989,7 +3018,7 @@ class StudioBrowserController {
             if (domPermissionDenied || netPermissionDenied) {
               // Give network response body a brief moment to settle if DOM fired first
               if (!capturedRunError) {
-                await new Promise((r) => setTimeout(r, 400))
+                await new Promise((r) => setTimeout(r, 500))
               }
               const toastText = await this.readPageToastOrErrorText(page)
               const statusLabel = capturedRunError?.status || 403
@@ -3154,6 +3183,7 @@ class StudioBrowserController {
         // CHANGE 3 & CHANGE 4 & CHANGE 5:
         // If a transient internal-error banner broke the loop, or after done/timeout, fetch and validate immediately.
         // On timeout (doneIndicator === null), still attempt one fetch + validate in case the answer finished on screen.
+        currentStage = 'run/validate'
         let validationReason = transientBannerReason || ''
         let fetchedSource: 'clipboard' | 'dom' = 'dom'
         let validation: StudioValidationResult | null = null
@@ -3244,6 +3274,7 @@ class StudioBrowserController {
         }
 
         // (f) Calibrate offset mode (relative 0:00 vs absolute startSec) and parse via parseChunkMatches!
+        currentStage = 'run/parse'
         const calibrated = await this.calibrateAndParseMatches({
           username,
           rawText: rawAnswer,
@@ -3299,10 +3330,40 @@ class StudioBrowserController {
           throw new Error('STOPPED BY USER')
         }
 
+        // Item 3: Do NOT retry on internal code bugs (TypeError / ReferenceError / SyntaxError / "is not a function").
+        // Immediately log "ERROR [code-bug] <fn name> <stage>" and stop without waiting 15/30/45s.
+        const isCodeBug =
+          err instanceof TypeError ||
+          err instanceof ReferenceError ||
+          err instanceof SyntaxError ||
+          /\bis not a function\b|\bis not defined\b|\bCannot read properties of\b|\bCannot destructure property\b/i.test(
+            msg,
+          )
+
+        if (isCodeBug) {
+          const fnFromMsg =
+            msg.match(/([a-zA-Z0-9_$.]+)\s+is\s+not\s+a\s+function/i)?.[1] ||
+            msg.match(/([a-zA-Z0-9_$.]+)\s+is\s+not\s+defined/i)?.[1]
+          const fnFromStack =
+            err instanceof Error && err.stack
+              ? err.stack
+                  .split('\n')
+                  .slice(1)
+                  .map((l) => l.match(/at\s+([a-zA-Z0-9_$.]+)/)?.[1])
+                  .find((fn) => fn && !/^Object\.|^process\.|^async/.test(fn))
+              : undefined
+          const fnName = fnFromMsg || fnFromStack || 'unknownFn'
+          const codeBugStep = `ERROR [code-bug] ${fnName} ${currentStage}`
+          this.logStep(codeBugStep, msg, 'error')
+          onLog?.('error', `${codeBugStep}: ${msg}`)
+          throw new Error(`${codeBugStep}: ${msg}`)
+        }
+
         if (
           msg.includes('PERMISSION_DENIED_EXHAUSTED:') ||
           msg.includes('INVALID_RESULT_EXHAUSTED:')
         ) {
+          this.logStep(`ERROR [${currentStage}]`, msg, 'error')
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
             username,
             effectiveRecycleInterval,
@@ -3312,6 +3373,7 @@ class StudioBrowserController {
         }
         const isPolicy = /(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(msg)
         if (isPolicy && sanitized) {
+          this.logStep(`ERROR [${currentStage}]`, `POLICY_BLOCKED: ${msg}`, 'error')
           await this.recordFinishedWindowJobAndMaybeRecyclePage(
             username,
             effectiveRecycleInterval,
@@ -3319,15 +3381,17 @@ class StudioBrowserController {
           )
           throw new Error(`POLICY_BLOCKED: ${msg}`)
         }
+
+        this.logStep(`ERROR [${currentStage}]`, msg.slice(0, 180), 'error')
         const backoffSec = attempt * 15
         this.logStep(
           `RETRY [runWindowJob] (${attempt}/${MAX_ATTEMPTS})`,
-          `ERROR: ${msg.slice(0, 100)} — waiting ${backoffSec}s`,
+          `stage=${currentStage} · ${msg.slice(0, 100)} — waiting ${backoffSec}s`,
           'warn',
         )
         onLog?.(
           'warn',
-          `RETRY [runWindowJob] Studio job ${jobLabel} attempt ${attempt}/${MAX_ATTEMPTS} error: ${msg} — retrying in ${backoffSec}s...`,
+          `ERROR [${currentStage}] Studio job ${jobLabel} attempt ${attempt}/${MAX_ATTEMPTS}: ${msg} — retrying in ${backoffSec}s...`,
         )
         if (attempt >= MAX_ATTEMPTS) {
           // Item 5: Count failed window job toward page recycle interval too
@@ -3378,7 +3442,6 @@ class StudioBrowserController {
     // Parse raw timestamps with chunkOffset = 0 first to inspect the raw numbers returned by Gemini Studio
     const rawParsed = parseChunkMatches(rawText, 0, 0, modelName)
     const blockDur = Math.max(1, movieEndSec - movieStartSec)
-    const shortPartDur = Math.max(1, shortEndSec - shortStartSec)
 
     if (rawParsed.length > 0 && movieStartSec >= 60) {
       // Check if raw movie timestamps clearly fall in [movieStartSec, movieEndSec] vs [0, blockDur]
@@ -3435,6 +3498,10 @@ class StudioBrowserController {
 
 const globalForStudio = globalThis as unknown as {
   __cmtStudioController?: StudioBrowserController
+}
+
+if (globalForStudio.__cmtStudioController) {
+  Object.setPrototypeOf(globalForStudio.__cmtStudioController, StudioBrowserController.prototype)
 }
 
 export const studioController =
