@@ -16,6 +16,7 @@ import {
   ExternalLink,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Loader2,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -38,7 +39,7 @@ interface StudioTestClipLine {
 }
 
 interface StudioTestClipResult {
-  status: 'idle' | 'running' | 'pass' | 'fail' | 'error'
+  status: 'idle' | 'running' | 'pass' | 'fail' | 'error' | 'stopped'
   summary: string
   lines: StudioTestClipLine[]
   startedAt: number
@@ -456,7 +457,9 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
               ? 'bg-emerald-500/10'
               : snap.testClipResult.status === 'running'
                 ? 'bg-sky-500/10'
-                : 'bg-destructive/10',
+                : snap.testClipResult.status === 'stopped'
+                  ? 'bg-amber-500/10'
+                  : 'bg-destructive/10',
           )}
         >
           <div className="flex flex-wrap items-center justify-between gap-2">
@@ -465,6 +468,8 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
                 <CheckCircle2 className="h-3.5 w-3.5 text-emerald-400" />
               ) : snap.testClipResult.status === 'running' ? (
                 <Loader2 className="h-3.5 w-3.5 text-sky-400 animate-spin" />
+              ) : snap.testClipResult.status === 'stopped' ? (
+                <AlertTriangle className="h-3.5 w-3.5 text-amber-400" />
               ) : (
                 <AlertCircle className="h-3.5 w-3.5 text-destructive" />
               )}
@@ -474,7 +479,9 @@ export function StudioLivePanel({ scan }: { scan: Scan | null }) {
                     ? 'text-emerald-300'
                     : snap.testClipResult.status === 'running'
                       ? 'text-sky-300'
-                      : 'text-destructive',
+                      : snap.testClipResult.status === 'stopped'
+                        ? 'text-amber-400'
+                        : 'text-destructive',
                 )}
               >
                 Test Clip Result: {snap.testClipResult.summary}

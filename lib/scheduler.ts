@@ -1970,7 +1970,15 @@ class Scheduler {
           const msg = err instanceof Error ? err.message : String(err)
           const isUserStopped = msg === 'STOPPED BY USER' || /stopped by user/i.test(msg)
           if (isUserStopped) {
-            addLog(scan, 'info', `${jobLabel}: STOPPED BY USER`)
+            for (const seg of coveredSegs) {
+              for (const ci of movieBlock.chunkIndexes) {
+                const ch = seg.chunks[ci]
+                if (ch && ch.status === 'scanning') {
+                  ch.status = 'pending'
+                }
+              }
+            }
+            addLog(scan, 'warn', `${jobLabel}: STOPPED BY USER (window marked not run)`)
             this.mark(job)
             return
           }

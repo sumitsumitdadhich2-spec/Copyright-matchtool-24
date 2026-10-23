@@ -335,6 +335,24 @@ export async function POST(req: NextRequest) {
             )
           } catch (err) {
             const msg = err instanceof Error ? err.message : String(err)
+            const isUserStopped =
+              msg === 'STOPPED BY USER' ||
+              /stopped by user/i.test(msg) ||
+              studioController.isStopping({ scanId: 'test-clip', username })
+
+            if (isUserStopped) {
+              console.log('[Studio Test Clip] STOPPED BY USER')
+              studioController.logStep('test clip STOPPED', 'STOPPED BY USER', 'warn')
+              studioController.setTestClipResult({
+                status: 'stopped',
+                summary: 'STOPPED BY USER',
+                lines: [],
+                startedAt: studioController.getTestClipResult()?.startedAt || Date.now(),
+                finishedAt: Date.now(),
+              })
+              return
+            }
+
             console.error('[Studio Test Clip] ERROR:', msg)
             studioController.logStep('test clip ERROR', msg, 'error')
             studioController.setTestClipResult({

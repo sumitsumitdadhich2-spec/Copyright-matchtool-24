@@ -35,7 +35,7 @@ export interface StudioTestClipLine {
 }
 
 export interface StudioTestClipResult {
-  status: 'running' | 'pass' | 'fail' | 'error'
+  status: 'running' | 'pass' | 'fail' | 'error' | 'stopped'
   summary: string
   lines: StudioTestClipLine[]
   startedAt: number
@@ -696,20 +696,25 @@ class StudioBrowserController {
    * it shows "Run settings", "System instructions", "Thinking level", "Media resolution", "Output length".
    */
   /**
-   * Check whether the right-hand Run Settings panel is currently open and visible in the DOM.
-   * Strictly verifies actual visible container elements without false-positive body text matching.
+   * Check whether the right-hand Run Settings panel is currently open and visible on screen in the DOM.
+   * Checks aria-expanded on the toggle button, visible close buttons in the right rail,
+   * visible panel controls, and on-screen container bounds.
    */
   private async isRunSettingsPanelOpen(page: Page): Promise<boolean> {
     try {
       return await page.evaluate(() => {
-        const isVisible = (el: Element | null): el is HTMLElement => {
+        const isElementVisibleOnScreen = (el: Element | null): el is HTMLElement => {
           if (!el) return false
           const h = el as HTMLElement
           const r = h.getBoundingClientRect()
           const style = window.getComputedStyle(h)
           return (
-            r.width >= 160 &&
-            r.height >= 80 &&
+            r.width > 25 &&
+            r.height > 25 &&
+            r.right > 0 &&
+            r.left < window.innerWidth &&
+            r.bottom > 0 &&
+            r.top < window.innerHeight &&
             style.visibility !== 'hidden' &&
             style.display !== 'none' &&
             style.opacity !== '0' &&
@@ -717,24 +722,60 @@ class StudioBrowserController {
           )
         }
 
+        // 1. Direct check on toggle button aria attributes (WAI-ARIA standard)
+        const toggleBtn = document.querySelector(
+          'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button, button[aria-label*="Run settings" i]',
+        ) as HTMLElement | null
+
+        if (toggleBtn) {
+          const expanded = toggleBtn.getAttribute('aria-expanded')
+          if (expanded === 'true') return true
+          if (expanded === 'false') return false
+
+          const pressed = toggleBtn.getAttribute('aria-pressed')
+          if (pressed === 'true') return true
+          if (pressed === 'false') return false
+        }
+
+        // 2. Check for Close button inside the panel on screen in the right rail
+        const closeBtns = Array.from(
+          document.querySelectorAll(
+            'button[aria-label*="Close run settings" i], button[aria-label="Close panel" i]',
+          ),
+        )
+        for (const b of closeBtns) {
+          if (isElementVisibleOnScreen(b) && b.getBoundingClientRect().left > window.innerWidth * 0.45) {
+            return true
+          }
+        }
+
+        // 3. Check for specific controls inside the panel visible on screen in the right rail
+        const panelControls = Array.from(
+          document.querySelectorAll(
+            'ms-thinking-budget-slider, mat-select[aria-label*="Thinking" i], [data-cmt-row-select="thinking-level"], ms-model-selector',
+          ),
+        )
+        for (const ctrl of panelControls) {
+          const r = (ctrl as HTMLElement).getBoundingClientRect()
+          if (isElementVisibleOnScreen(ctrl) && r.left > window.innerWidth * 0.45 && r.width >= 40) {
+            return true
+          }
+        }
+
+        // 4. Check for panel container docked and visible on screen in the right rail
         const containers = Array.from(
           document.querySelectorAll(
-            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i], [class*="runsettings" i]:not(button):not([class*="toggle" i]), [class*="run-settings" i]:not(button):not([class*="toggle" i])',
+            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, aside.runsettings-panel, div.runsettings-panel',
           ),
         )
         for (const c of containers) {
-          if (isVisible(c)) return true
-        }
-
-        // Check if Thinking dropdown/slider or model selector is directly visible on right side of viewport
-        const rightControls = Array.from(
-          document.querySelectorAll(
-            'ms-model-selector, ms-thinking-budget-slider, mat-select[aria-label*="Thinking" i], [data-cmt-row-select="thinking-level"]',
-          ),
-        )
-        for (const ctrl of rightControls) {
-          const r = (ctrl as HTMLElement).getBoundingClientRect()
-          if (isVisible(ctrl) && r.left > window.innerWidth * 0.4) {
+          const r = c.getBoundingClientRect()
+          if (
+            isElementVisibleOnScreen(c) &&
+            r.left > window.innerWidth * 0.45 &&
+            r.left < window.innerWidth &&
+            r.width >= 180
+          ) {
             return true
           }
         }
@@ -779,7 +820,7 @@ class StudioBrowserController {
    * Ensure the right-hand Run Settings panel is open.
    * New chats have the Run Settings panel closed. Before searching for the dropdown,
    * clicks button[aria-label="Toggle run settings panel"] to open the panel and
-   * waits until the panel is in the DOM.
+   * waits until the panel is in the DOM (max ~5s).
    */
   private async ensureRunSettingsPanelOpen(page: Page): Promise<boolean> {
     if (await this.isRunSettingsPanelOpen(page)) return true
@@ -792,30 +833,36 @@ class StudioBrowserController {
     const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2500)
     if (toggle) {
       await toggle.click().catch(() => {})
-      for (let i = 0; i < 16; i++) {
-        await new Promise((r) => setTimeout(r, 250))
-        if (await this.isRunSettingsPanelOpen(page)) return true
+    } else {
+      await page
+        .evaluate(() => {
+          const btn = document.querySelector(
+            'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button, button[aria-label*="Run settings" i]',
+          ) as HTMLElement | null
+          if (btn) btn.click()
+        })
+        .catch(() => {})
+    }
+
+    // Wait until panel is in the DOM and visible (max ~5s)
+    for (let i = 0; i < 20; i++) {
+      await new Promise((r) => setTimeout(r, 250))
+      if (await this.isRunSettingsPanelOpen(page)) {
+        await new Promise((r) => setTimeout(r, 200))
+        return true
       }
     }
 
-    // Second attempt via direct DOM click on button[aria-label="Toggle run settings panel"]
-    const clickedDom = await page
-      .evaluate(() => {
-        const btn = document.querySelector(
-          'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button, button[aria-label*="Run settings" i]',
-        ) as HTMLElement | null
-        if (btn) {
-          btn.click()
+    // Fallback attempt: if still not open after 5s, try clicking toggle once more
+    const toggleRetry = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 1000)
+    if (toggleRetry) {
+      await toggleRetry.click().catch(() => {})
+      for (let i = 0; i < 12; i++) {
+        await new Promise((r) => setTimeout(r, 250))
+        if (await this.isRunSettingsPanelOpen(page)) {
+          await new Promise((r) => setTimeout(r, 200))
           return true
         }
-        return false
-      })
-      .catch(() => false)
-
-    if (clickedDom) {
-      for (let i = 0; i < 16; i++) {
-        await new Promise((r) => setTimeout(r, 250))
-        if (await this.isRunSettingsPanelOpen(page)) return true
       }
     }
 
@@ -1071,18 +1118,19 @@ class StudioBrowserController {
     await this.waitIfPausedOrThrowIfStopped(scope)
 
     // 0. New chats have the Run Settings panel closed. Before searching for the dropdown,
-    // ensure panel is opened by clicking toggle and waiting for panel in the DOM.
+    // check if panel is open; if closed, click button[aria-label="Toggle run settings panel"]
+    // and wait until the panel is in the DOM (max ~5s), then search for dropdown.
     let panelOpened = await this.isRunSettingsPanelOpen(page)
     if (!panelOpened) {
-      this.logStep('opening run settings', 'Run settings panel closed in chat -> clicking toggle', 'info')
+      this.logStep('opening run settings', 'Panel closed in chat -> clicking toggle and waiting for DOM (max ~5s)', 'info')
       panelOpened = await this.ensureRunSettingsPanelOpen(page)
     }
     if (!panelOpened) {
-      await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings panel did not open after clicking toggle')
+      await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings panel did not open after toggle click')
       throw new Error('Studio thinking level config failed: Run settings panel could not be opened')
     }
 
-    // 1. Set "Thinking level" dropdown to High & READ BACK visible value (retry once, dump panel HTML, then THROW)
+    // 1. Set "Thinking level" dropdown to High & READ BACK visible value
     let verifiedThinkingText = ''
     let thinkingConfigError = ''
 
@@ -1090,7 +1138,7 @@ class StudioBrowserController {
       await this.waitIfPausedOrThrowIfStopped(scope)
       thinkingConfigError = ''
 
-      // Check if the panel is open before attempting dropdown interaction
+      // Confirm panel is open in DOM before attempting dropdown interaction
       if (!(await this.isRunSettingsPanelOpen(page))) {
         await this.ensureRunSettingsPanelOpen(page)
       }
@@ -1109,7 +1157,8 @@ class StudioBrowserController {
         /* ignore */
       }
 
-      let thinkSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingLevelSelect, 1500)
+      // Search for dropdown with 3000ms locator timeout now that panel is open
+      let thinkSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingLevelSelect, 3000)
       if (!thinkSelect) {
         const markedThink = await this.markRowDropdownByLabel(
           page,
@@ -1123,7 +1172,10 @@ class StudioBrowserController {
 
       if (!thinkSelect || (await thinkSelect.count()) === 0) {
         thinkingConfigError = 'Thinking level dropdown selector not found in Run settings panel'
-        await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
+        // Dump diagnostics ONLY on attempt 2 to eliminate noise
+        if (thinkAttempt >= 2) {
+          await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
+        }
       } else {
         const beforeThink = await this.readVisibleThinkingLevelText(page)
         if (!/\bhigh\b/i.test(beforeThink)) {
@@ -1142,7 +1194,9 @@ class StudioBrowserController {
             await new Promise((r) => setTimeout(r, 350))
           } else {
             thinkingConfigError = '"High" option not found after opening Thinking level dropdown'
-            await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
+            if (thinkAttempt >= 2) {
+              await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
+            }
             await this.dismissOpenOverlayIfAny(page)
           }
         }
@@ -1155,11 +1209,14 @@ class StudioBrowserController {
         if (!thinkingConfigError) {
           thinkingConfigError = `expected "High", read back "${readBackThink || 'empty'}"`
         }
-        await this.dumpRunSettingsPanelDiagnostics(page, `thinking level read-back mismatch: ${thinkingConfigError}`)
+        if (thinkAttempt >= 2) {
+          await this.dumpRunSettingsPanelDiagnostics(page, `thinking level read-back mismatch: ${thinkingConfigError}`)
+        }
       }
 
-      this.logStep(`thinking retry ${thinkAttempt}/2`, thinkingConfigError, 'warn')
-      if (thinkAttempt >= 2) {
+      if (thinkAttempt < 2 && thinkingConfigError) {
+        this.logStep(`thinking retry ${thinkAttempt}/2`, thinkingConfigError, 'warn')
+      } else if (thinkAttempt >= 2 && thinkingConfigError) {
         throw new Error(`Studio thinking level config failed: ${thinkingConfigError}`)
       }
     }
