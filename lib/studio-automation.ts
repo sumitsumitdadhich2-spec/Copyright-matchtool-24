@@ -2806,37 +2806,133 @@ class StudioBrowserController {
     const MODEL_FALLBACK_CHAIN = ['Gemini 3.8 Flash', 'Gemini 3.7 Flash', 'Gemini 3.6 Flash']
     let activeModelIndex = 0
     let activeModelName = modelName || MODEL_FALLBACK_CHAIN[0]
-    let refreshInsteadOfNewChat = false
+    let resetOnPermissionDenied = false
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       let currentStage = 'setup/ensure_page'
       await this.waitIfPausedOrThrowIfStopped(scope)
 
       try {
-        const page = await this.ensurePage(username)
+        let page = await this.ensurePage(username)
         if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0) {
           this.logStep('browser info', this.browserLaunchInfo, 'info')
         }
 
-        // (a) On 403 PERMISSION_DENIED retry: refresh current browser page (page.reload) instead of opening new chat.
+        // (a) On 403 PERMISSION_DENIED retry: alternate between:
+        //   - Odd 403 retry (1, 3, 5, 7, 9): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
+        //   - Even 403 retry (2, 4, 6, 8): Full browser restart (close context, relaunch persistent profile studio-chromium-profile, open fresh page, goto new_chat)
         // On normal start or any other error retry: open a NEW chat on aistudio.google.com.
-        if (refreshInsteadOfNewChat) {
-          refreshInsteadOfNewChat = false
-          currentStage = 'setup/refresh_page'
+        if (resetOnPermissionDenied) {
+          resetOnPermissionDenied = false
           const permAttemptNum = permissionDeniedRetries + 1
-          this.logStep(
-            'refreshing browser',
-            `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName})`,
-            'info',
-          )
-          onLog?.(
-            'info',
-            `Refreshing browser page for ${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName})`,
-          )
-          await page.reload({
-            waitUntil: 'domcontentloaded',
-            timeout: 45_000,
-          })
+          const isHardPageReset = permissionDeniedRetries % 2 === 1
+          const storageTypesToClear = 'local_storage,indexeddb,cache_storage,service_workers,websql'
+
+          const clearCacheAndStorageViaCdp = async (targetPage: Page): Promise<string[]> => {
+            if (!this.context) return []
+            const clearedItems: string[] = []
+            let cdp: Awaited<ReturnType<BrowserContext['newCDPSession']>> | null = null
+            try {
+              cdp = await this.context.newCDPSession(targetPage)
+              try {
+                await cdp.send('Network.clearBrowserCache')
+                clearedItems.push('Network.clearBrowserCache')
+              } catch {
+                /* ignore cache clear warning */
+              }
+              try {
+                await cdp.send('Storage.clearDataForOrigin', {
+                  origin: 'https://aistudio.google.com',
+                  storageTypes: storageTypesToClear,
+                })
+                clearedItems.push(`Storage.clearDataForOrigin(${storageTypesToClear})`)
+              } catch {
+                /* ignore storage clear warning */
+              }
+            } catch {
+              /* ignore cdp session warning */
+            } finally {
+              if (cdp) {
+                await cdp.detach().catch(() => {})
+              }
+            }
+            return clearedItems
+          }
+
+          if (isHardPageReset) {
+            currentStage = 'setup/hard_reset_page'
+            if (!this.context) {
+              page = await this.ensurePage(username)
+            }
+            const oldPages = this.context ? [...this.context.pages()] : [page]
+            const freshPage = await this.context!.newPage()
+            for (const oldP of oldPages) {
+              if (oldP !== freshPage && !oldP.isClosed()) {
+                await oldP.close().catch(() => {})
+              }
+            }
+            const clearedList = await clearCacheAndStorageViaCdp(freshPage)
+            await freshPage.setViewportSize(VIEWPORT)
+            this.page = freshPage
+            page = freshPage
+
+            const clearedDesc =
+              clearedList.length > 0
+                ? clearedList.join(' + ')
+                : `cache + storage (${storageTypesToClear})`
+            const resetDetail = `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName}) — old page closed, cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+            this.logStep('403 -> hard reset (page+cache)', resetDetail, 'info')
+            onLog?.('info', `403 -> hard reset (page+cache): ${resetDetail}`)
+
+            await page.goto(STUDIO_URLS.newChat, {
+              waitUntil: 'domcontentloaded',
+              timeout: 45_000,
+            })
+          } else {
+            currentStage = 'setup/browser_restart'
+            let clearedList: string[] = []
+            if (this.context && page && !page.isClosed()) {
+              clearedList = await clearCacheAndStorageViaCdp(page)
+            }
+            if (this.context) {
+              try {
+                await this.context.close()
+              } catch {
+                /* ignore context close warning */
+              }
+              this.context = null
+              this.page = null
+            }
+            await new Promise((r) => setTimeout(r, 1000))
+
+            await this.ensurePage(username)
+            const existingPages = this.context ? [...this.context.pages()] : []
+            const freshPage = await this.context!.newPage()
+            for (const oldP of existingPages) {
+              if (oldP !== freshPage && !oldP.isClosed()) {
+                await oldP.close().catch(() => {})
+              }
+            }
+            if (clearedList.length === 0) {
+              clearedList = await clearCacheAndStorageViaCdp(freshPage)
+            }
+            await freshPage.setViewportSize(VIEWPORT)
+            this.page = freshPage
+            page = freshPage
+
+            const clearedDesc =
+              clearedList.length > 0
+                ? clearedList.join(' + ')
+                : `cache + storage (${storageTypesToClear})`
+            const restartDetail = `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName}) — context closed & relaunched persistent profile (studio-chromium-profile), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+            this.logStep('403 -> browser restart', restartDetail, 'info')
+            onLog?.('info', `403 -> browser restart: ${restartDetail}`)
+
+            await page.goto(STUDIO_URLS.newChat, {
+              waitUntil: 'domcontentloaded',
+              timeout: 45_000,
+            })
+          }
         } else {
           currentStage = 'setup/new_chat'
           this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
@@ -3065,14 +3161,16 @@ class StudioBrowserController {
               }
               activeModelName = MODEL_FALLBACK_CHAIN[activeModelIndex]
 
+              const nextResetLabel =
+                permissionDeniedRetries % 2 === 1 ? '403 -> hard reset (page+cache)' : '403 -> browser restart'
               this.logStep(
                 'permission denied - retrying',
-                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName} (waiting 15s, then refreshing browser)`,
+                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName} (waiting 15s, then ${nextResetLabel})`,
                 'warn',
               )
               onLog?.(
                 'warn',
-                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 15s, refreshing browser and switching model to "${activeModelName}"`,
+                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 15s, then ${nextResetLabel} and switching model to "${activeModelName}"`,
               )
 
               if (permissionDeniedRetries >= MAX_PERMISSION_RETRIES) {
@@ -3196,8 +3294,8 @@ class StudioBrowserController {
 
         if (permissionDeniedTriggered) {
           await this.saveRotatedSessionFromContext(username)
-          refreshInsteadOfNewChat = true
-          // Do NOT consume normal MAX_ATTEMPTS = 3; refresh the current browser page at the top of the loop and redo the full window setup
+          resetOnPermissionDenied = true
+          // Do NOT consume normal MAX_ATTEMPTS = 3; perform hard page reset or browser restart at the top of the loop and redo the full window setup
           attempt -= 1
           continue
         }
