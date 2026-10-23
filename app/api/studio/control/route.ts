@@ -114,6 +114,7 @@ export async function POST(req: NextRequest) {
           return NextResponse.json({ ok: false, error: 'Paste Cookie-Editor JSON first' }, { status: 400 })
         }
         const saved = await saveUserGoogleCookies(username, body.cookiesJson)
+        await studioController.applySavedCookiesToContext(username)
         return NextResponse.json({
           ok: true,
           cookieCount: saved.count,

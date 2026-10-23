@@ -61,6 +61,7 @@ export interface StudioLiveSnapshot {
 }
 
 const VIEWPORT = { width: 1366, height: 840 }
+const STUDIO_CHROME_PROFILE_NAME = 'studio-chrome-profile'
 
 class StudioBrowserController {
   private context: BrowserContext | null = null
@@ -239,6 +240,48 @@ class StudioBrowserController {
     }
   }
 
+  private async ensureXvfbDisplay(): Promise<string> {
+    if (!process.env.DISPLAY) {
+      process.env.DISPLAY = ':99'
+    }
+    const display = process.env.DISPLAY
+    const match = display.match(/^:(\d+)/)
+    const displayNum = match ? match[1] : '99'
+    const xSocket = `/tmp/.X11-unix/X${displayNum}`
+    if (fs.existsSync(xSocket)) {
+      return display
+    }
+    if (fs.existsSync('/usr/bin/Xvfb')) {
+      try {
+        const { spawn } = await import('child_process')
+        try {
+          fs.mkdirSync('/tmp/.X11-unix', { recursive: true, mode: 0o1777 })
+        } catch {
+          /* ignore */
+        }
+        try {
+          const lockFile = `/tmp/.X${displayNum}-lock`
+          if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile)
+        } catch {
+          /* ignore */
+        }
+        const child = spawn(
+          '/usr/bin/Xvfb',
+          [`:${displayNum}`, '-screen', '0', '1366x840x24', '-nolisten', 'tcp', '-ac'],
+          { detached: true, stdio: 'ignore' },
+        )
+        child.unref()
+        for (let i = 0; i < 25; i++) {
+          if (fs.existsSync(xSocket)) break
+          await new Promise((r) => setTimeout(r, 100))
+        }
+      } catch {
+        /* ignore Xvfb spawn error; Playwright launch will report if DISPLAY fails */
+      }
+    }
+    return display
+  }
+
   public async ensurePage(username: string): Promise<Page> {
     if (this.page && !this.page.isClosed() && this.context) {
       await this.context
@@ -253,7 +296,9 @@ class StudioBrowserController {
           fs.existsSync(p),
         )
         const displayEnv = process.env.DISPLAY || ''
-        this.browserLaunchInfo = `binary=${sysChrome || pwPath} · mode=${displayEnv ? 'headed' : 'headless (no DISPLAY)'}`
+        this.browserLaunchInfo = sysChrome && displayEnv
+          ? `channel=chrome · mode=headed · profile=${STUDIO_CHROME_PROFILE_NAME} · path=${sysChrome} · display=${displayEnv}`
+          : `WARN: binary=${sysChrome || pwPath} · mode=${displayEnv ? 'headed' : 'headless (no DISPLAY)'} · profile=${STUDIO_CHROME_PROFILE_NAME}`
       }
       return this.page
     }
@@ -262,18 +307,20 @@ class StudioBrowserController {
 
     this.launching = (async () => {
       try {
-        const profileDir = path.join(DATA_DIR, 'studio-chromium-profile')
+        const profileDir = path.join(DATA_DIR, STUDIO_CHROME_PROFILE_NAME)
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
 
-        // Clean up any stale SingletonLock from an unclean restart
+        // Clean up any stale SingletonLock/SingletonSocket broken symlinks from an unclean restart
         for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
           const lockFile = path.join(profileDir, lockName)
           try {
-            if (fs.existsSync(lockFile)) fs.unlinkSync(lockFile)
+            fs.rmSync(lockFile, { force: true })
           } catch {
             /* ignore */
           }
         }
+
+        const displayEnv = await this.ensureXvfbDisplay()
 
         const baseArgs = [
           '--no-sandbox',
@@ -291,11 +338,10 @@ class StudioBrowserController {
           '/usr/bin/chromium-browser',
         ].find((p) => fs.existsSync(p))
         const pwExecPath = chromium.executablePath()
-        const displayEnv = process.env.DISPLAY || ''
 
         this.logStep(
           'browser launching',
-          `Checking Chrome/Chromium (systemChrome=${sysChromePath || 'none'}, playwrightChromium=${pwExecPath}, DISPLAY=${displayEnv || 'none'})`,
+          `Checking Chrome/Chromium (systemChrome=${sysChromePath || 'none'}, playwrightChromium=${pwExecPath}, DISPLAY=${displayEnv || 'none'}, profile=${STUDIO_CHROME_PROFILE_NAME})`,
         )
 
         try {
@@ -305,28 +351,28 @@ class StudioBrowserController {
             viewport: VIEWPORT,
             args: baseArgs,
           })
-          this.browserLaunchInfo = `channel=chrome · path=${sysChromePath || 'system-chrome'} · mode=headed · profile=${profileDir}`
+          this.browserLaunchInfo = `channel=chrome · mode=headed · profile=${STUDIO_CHROME_PROFILE_NAME} · path=${sysChromePath || 'system-chrome'} · display=${displayEnv}`
           this.logStep('browser launched', this.browserLaunchInfo, 'success')
         } catch (chromeErr) {
-          const chromeErrMsg = chromeErr instanceof Error ? chromeErr.message.split('\n')[0].slice(0, 120) : String(chromeErr)
+          const chromeErrMsg = chromeErr instanceof Error ? chromeErr.message.split('\n')[0].slice(0, 140) : String(chromeErr)
           try {
             this.context = await chromium.launchPersistentContext(profileDir, {
               headless: false,
               viewport: VIEWPORT,
               args: baseArgs,
             })
-            this.browserLaunchInfo = `chromium · path=${pwExecPath} · mode=headed · profile=${profileDir}`
-            this.logStep('browser launched', this.browserLaunchInfo, 'success')
+            this.browserLaunchInfo = `WARN: channel=chrome failed (${chromeErrMsg}); fallback=chromium · mode=headed · profile=${STUDIO_CHROME_PROFILE_NAME} · path=${pwExecPath}`
+            this.logStep('browser launched (fallback)', this.browserLaunchInfo, 'warn')
           } catch (headedErr) {
             const headedErrMsg =
-              headedErr instanceof Error ? headedErr.message.split('\n')[0].slice(0, 120) : String(headedErr)
+              headedErr instanceof Error ? headedErr.message.split('\n')[0].slice(0, 140) : String(headedErr)
             this.context = await chromium.launchPersistentContext(profileDir, {
               headless: true,
               viewport: VIEWPORT,
               args: baseArgs,
             })
-            this.browserLaunchInfo = `chromium · path=${pwExecPath} · mode=headless (headed unavailable: ${chromeErrMsg} / ${headedErrMsg}) · profile=${profileDir}`
-            this.logStep('browser launched', this.browserLaunchInfo, 'warn')
+            this.browserLaunchInfo = `WARN: Headed launch failed [chrome: ${chromeErrMsg} | headed-chromium: ${headedErrMsg} | DISPLAY=${displayEnv || 'none'}]; fallback=chromium · mode=headless · profile=${STUDIO_CHROME_PROFILE_NAME} · path=${pwExecPath}`
+            this.logStep('WARN [headless fallback]', this.browserLaunchInfo, 'warn')
           }
         }
 
@@ -335,6 +381,19 @@ class StudioBrowserController {
             origin: 'https://aistudio.google.com',
           })
           .catch(() => {})
+
+        // If the new studio-chrome-profile has no Google cookies yet, seed once from any pasted/saved user cookies
+        try {
+          const existingGoogleCookies = await this.context.cookies([
+            'https://aistudio.google.com',
+            'https://accounts.google.com',
+          ])
+          if (existingGoogleCookies.length === 0) {
+            await this.injectUserCookies(username)
+          }
+        } catch {
+          /* ignore initial cookie check */
+        }
 
         const pages = this.context.pages()
         this.page = pages.length > 0 ? pages[0] : await this.context.newPage()
@@ -357,7 +416,7 @@ class StudioBrowserController {
   public async saveRotatedSessionFromContext(username: string): Promise<void> {
     if (!this.context) return
     try {
-      const profileDir = path.join(DATA_DIR, 'studio-chromium-profile')
+      const profileDir = path.join(DATA_DIR, STUDIO_CHROME_PROFILE_NAME)
       const statePath = path.join(profileDir, 'storage-state.json')
       const state = await this.context.storageState({ path: statePath })
       const rotatedCookies = await this.context.cookies([
@@ -375,6 +434,12 @@ class StudioBrowserController {
     } catch {
       /* ignore cookie rotation persistence warning */
     }
+  }
+
+  public async applySavedCookiesToContext(username: string): Promise<void> {
+    if (!this.context) return
+    await this.injectUserCookies(username)
+    await this.saveRotatedSessionFromContext(username)
   }
 
   private async injectUserCookies(username: string) {
@@ -2815,12 +2880,13 @@ class StudioBrowserController {
       try {
         let page = await this.ensurePage(username)
         if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0) {
-          this.logStep('browser info', this.browserLaunchInfo, 'info')
+          const isFallbackWarn = /WARN|mode=headless/i.test(this.browserLaunchInfo)
+          this.logStep('browser info', this.browserLaunchInfo, isFallbackWarn ? 'warn' : 'info')
         }
 
         // (a) On 403 PERMISSION_DENIED retry: alternate between:
         //   - Odd 403 retry (1, 3, 5, 7, 9): Hard page reset (close old page, clear cache + site storage via CDP without touching cookies, open fresh page in same context, goto new_chat)
-        //   - Even 403 retry (2, 4, 6, 8): Full browser restart (close context, relaunch persistent profile studio-chromium-profile, open fresh page, goto new_chat)
+        //   - Even 403 retry (2, 4, 6, 8): Full browser restart (close context, relaunch persistent profile studio-chrome-profile, open fresh page, goto new_chat)
         // On normal start or any other error retry: open a NEW chat on aistudio.google.com.
         if (resetOnPermissionDenied) {
           resetOnPermissionDenied = false
@@ -2924,7 +2990,7 @@ class StudioBrowserController {
               clearedList.length > 0
                 ? clearedList.join(' + ')
                 : `cache + storage (${storageTypesToClear})`
-            const restartDetail = `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName}) — context closed & relaunched persistent profile (studio-chromium-profile), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
+            const restartDetail = `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName}) — context closed & relaunched persistent profile (${STUDIO_CHROME_PROFILE_NAME}), cleared [${clearedDesc}] for https://aistudio.google.com (cookies preserved), opened new page -> new_chat`
             this.logStep('403 -> browser restart', restartDetail, 'info')
             onLog?.('info', `403 -> browser restart: ${restartDetail}`)
 
