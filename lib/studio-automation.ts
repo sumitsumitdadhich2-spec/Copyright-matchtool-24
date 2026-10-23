@@ -2797,7 +2797,7 @@ class StudioBrowserController {
     const minPlausible24FpsTokens = Math.round(totalVideoSec * 500)
 
     const MAX_ATTEMPTS = 3
-    const MAX_PERMISSION_RETRIES = 5
+    const MAX_PERMISSION_RETRIES = 10
     let permissionDeniedRetries = 0
     const MAX_INVALID_RESULT_RETRIES = 3
     let invalidResultRetries = 0
@@ -3046,12 +3046,12 @@ class StudioBrowserController {
 
               this.logStep(
                 'permission denied - retrying',
-                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName}`,
+                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName} (waiting 15s)`,
                 'warn',
               )
               onLog?.(
                 'warn',
-                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — switching model to "${activeModelName}" and retrying in a new chat`,
+                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 15s, switching model to "${activeModelName}" and retrying in a new chat`,
               )
 
               if (permissionDeniedRetries > MAX_PERMISSION_RETRIES) {
@@ -3059,7 +3059,7 @@ class StudioBrowserController {
                   `PERMISSION_DENIED_EXHAUSTED: ${exactErrLog} after ${MAX_PERMISSION_RETRIES} permission retries on ${jobLabel}`,
                 )
               }
-              await new Promise((r) => setTimeout(r, 5000))
+              await new Promise((r) => setTimeout(r, 15_000))
               permissionDeniedTriggered = true
               break
             }
