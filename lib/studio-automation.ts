@@ -2806,6 +2806,7 @@ class StudioBrowserController {
     const MODEL_FALLBACK_CHAIN = ['Gemini 3.8 Flash', 'Gemini 3.7 Flash', 'Gemini 3.6 Flash']
     let activeModelIndex = 0
     let activeModelName = modelName || MODEL_FALLBACK_CHAIN[0]
+    let refreshInsteadOfNewChat = false
 
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       let currentStage = 'setup/ensure_page'
@@ -2813,17 +2814,37 @@ class StudioBrowserController {
 
       try {
         const page = await this.ensurePage(username)
-        if (this.browserLaunchInfo && attempt === 1) {
+        if (this.browserLaunchInfo && attempt === 1 && permissionDeniedRetries === 0) {
           this.logStep('browser info', this.browserLaunchInfo, 'info')
         }
 
-        // (a) Open a NEW chat on aistudio.google.com
-        currentStage = 'setup/new_chat'
-        this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
-        await page.goto(STUDIO_URLS.newChat, {
-          waitUntil: 'domcontentloaded',
-          timeout: 45_000,
-        })
+        // (a) On 403 PERMISSION_DENIED retry: refresh current browser page (page.reload) instead of opening new chat.
+        // On normal start or any other error retry: open a NEW chat on aistudio.google.com.
+        if (refreshInsteadOfNewChat) {
+          refreshInsteadOfNewChat = false
+          currentStage = 'setup/refresh_page'
+          const permAttemptNum = permissionDeniedRetries + 1
+          this.logStep(
+            'refreshing browser',
+            `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName})`,
+            'info',
+          )
+          onLog?.(
+            'info',
+            `Refreshing browser page for ${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}, attempt ${permAttemptNum}/${MAX_PERMISSION_RETRIES}, model=${activeModelName})`,
+          )
+          await page.reload({
+            waitUntil: 'domcontentloaded',
+            timeout: 45_000,
+          })
+        } else {
+          currentStage = 'setup/new_chat'
+          this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
+          await page.goto(STUDIO_URLS.newChat, {
+            waitUntil: 'domcontentloaded',
+            timeout: 45_000,
+          })
+        }
         await new Promise((r) => setTimeout(r, 2500))
         await this.dismissAnyOnboardingModals(page)
 
@@ -3046,17 +3067,17 @@ class StudioBrowserController {
 
               this.logStep(
                 'permission denied - retrying',
-                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName} (waiting 15s)`,
+                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName} (waiting 15s, then refreshing browser)`,
                 'warn',
               )
               onLog?.(
                 'warn',
-                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 15s, switching model to "${activeModelName}" and retrying in a new chat`,
+                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 15s, refreshing browser and switching model to "${activeModelName}"`,
               )
 
-              if (permissionDeniedRetries > MAX_PERMISSION_RETRIES) {
+              if (permissionDeniedRetries >= MAX_PERMISSION_RETRIES) {
                 throw new Error(
-                  `PERMISSION_DENIED_EXHAUSTED: ${exactErrLog} after ${MAX_PERMISSION_RETRIES} permission retries on ${jobLabel}`,
+                  `PERMISSION_DENIED_EXHAUSTED: ${exactErrLog} after ${MAX_PERMISSION_RETRIES} permission attempts on ${jobLabel}`,
                 )
               }
               await new Promise((r) => setTimeout(r, 15_000))
@@ -3175,7 +3196,8 @@ class StudioBrowserController {
 
         if (permissionDeniedTriggered) {
           await this.saveRotatedSessionFromContext(username)
-          // Do NOT consume normal MAX_ATTEMPTS = 3; open a new chat at the top of the loop and redo the same job
+          refreshInsteadOfNewChat = true
+          // Do NOT consume normal MAX_ATTEMPTS = 3; refresh the current browser page at the top of the loop and redo the full window setup
           attempt -= 1
           continue
         }
