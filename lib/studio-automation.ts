@@ -1,6 +1,6 @@
 import fs from 'fs'
 import path from 'path'
-import { chromium, type BrowserContext, type Page } from 'playwright'
+import { chromium, type BrowserContext, type Page, type Response as PlaywrightResponse } from 'playwright'
 import { DATA_DIR } from './paths'
 import {
   STUDIO_SELECTORS,
@@ -9,6 +9,7 @@ import {
 } from './studio-selectors'
 import {
   computeEffectiveMaxInputTokens,
+  encryptSecret,
   loadDecryptedPlaywrightCookies,
   loadStudioUserConfig,
   saveStudioUserConfig,
@@ -237,16 +238,14 @@ class StudioBrowserController {
     }
   }
 
-  public async ensurePage(username: string, forceReloadCookies = false): Promise<Page> {
+  public async ensurePage(username: string, _forceReloadCookies = false): Promise<Page> {
     if (this.page && !this.page.isClosed() && this.context) {
       await this.context
         .grantPermissions(['clipboard-read', 'clipboard-write'], {
           origin: 'https://aistudio.google.com',
         })
         .catch(() => {})
-      if (forceReloadCookies || this.lastInjectedCookieUser !== username) {
-        await this.injectUserCookies(username)
-      }
+      this.lastInjectedCookieUser = username
       return this.page
     }
 
@@ -257,7 +256,7 @@ class StudioBrowserController {
         const profileDir = path.join(DATA_DIR, 'studio-chromium-profile')
         if (!fs.existsSync(profileDir)) fs.mkdirSync(profileDir, { recursive: true })
 
-        // Clean up any stale SingletonLock from an unclean container restart
+        // Clean up any stale SingletonLock from an unclean restart
         for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
           const lockFile = path.join(profileDir, lockName)
           try {
@@ -267,20 +266,48 @@ class StudioBrowserController {
           }
         }
 
-        this.logStep('browser launching', 'Starting headless Chromium persistent context')
-        this.context = await chromium.launchPersistentContext(profileDir, {
-          headless: true,
-          viewport: VIEWPORT,
-          userAgent:
-            'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-blink-features=AutomationControlled',
-            '--window-size=1366,840',
-          ],
-        })
+        const baseArgs = [
+          '--no-sandbox',
+          '--disable-setuid-sandbox',
+          '--disable-dev-shm-usage',
+          '--disable-blink-features=AutomationControlled',
+          '--window-size=1366,840',
+        ]
+
+        // Launch headed real Chrome (channel: 'chrome', headless: false) with persistent user-data-dir.
+        // Do NOT inject cookies here — the user logs in once in the persistent profile.
+        this.logStep(
+          'browser launching',
+          'Starting headed real Chrome (channel: chrome) with persistent user-data-dir',
+        )
+        try {
+          this.context = await chromium.launchPersistentContext(profileDir, {
+            headless: false,
+            channel: 'chrome',
+            viewport: VIEWPORT,
+            args: baseArgs,
+          })
+        } catch (chromeErr) {
+          // Fallback if system 'chrome' channel or X server is unavailable in container
+          try {
+            this.context = await chromium.launchPersistentContext(profileDir, {
+              headless: false,
+              viewport: VIEWPORT,
+              args: baseArgs,
+            })
+          } catch {
+            this.logStep(
+              'browser fallback',
+              `Headed Chrome launch unavailable (${chromeErr instanceof Error ? chromeErr.message.slice(0, 80) : 'no display'}), using persistent profile context`,
+              'warn',
+            )
+            this.context = await chromium.launchPersistentContext(profileDir, {
+              headless: true,
+              viewport: VIEWPORT,
+              args: baseArgs,
+            })
+          }
+        }
 
         await this.context
           .grantPermissions(['clipboard-read', 'clipboard-write'], {
@@ -292,7 +319,7 @@ class StudioBrowserController {
         this.page = pages.length > 0 ? pages[0] : await this.context.newPage()
         await this.page.setViewportSize(VIEWPORT)
 
-        await this.injectUserCookies(username)
+        this.lastInjectedCookieUser = username
         return this.page
       } finally {
         this.launching = null
@@ -300,6 +327,34 @@ class StudioBrowserController {
     })()
 
     return this.launching
+  }
+
+  /**
+   * Persist updated/rotated Google cookies and storage state from the persistent browser context
+   * after every job (Google cookies rotate frequently during active sessions).
+   */
+  public async saveRotatedSessionFromContext(username: string): Promise<void> {
+    if (!this.context) return
+    try {
+      const profileDir = path.join(DATA_DIR, 'studio-chromium-profile')
+      const statePath = path.join(profileDir, 'storage-state.json')
+      const state = await this.context.storageState({ path: statePath })
+      const rotatedCookies = await this.context.cookies([
+        'https://aistudio.google.com',
+        'https://accounts.google.com',
+        'https://google.com',
+      ])
+      const cookiesToSave = rotatedCookies.length > 0 ? rotatedCookies : state.cookies
+      if (cookiesToSave.length > 0) {
+        const encrypted = encryptSecret(JSON.stringify(cookiesToSave))
+        await saveStudioUserConfig(username, {
+          encryptedCookies: encrypted,
+          cookiesUpdatedAt: Date.now(),
+        })
+      }
+    } catch {
+      /* ignore cookie rotation persistence warning */
+    }
   }
 
   private async injectUserCookies(username: string) {
@@ -332,12 +387,14 @@ class StudioBrowserController {
    * Item 5: Page recycling — after every N finished window jobs (success or failed, default 5),
    * close the Playwright page and open a fresh page in the SAME persistent context (cookies kept),
    * then continue. Logs "page recycled" in the step log.
+   * Also saves rotated cookies/profile after every finished job.
    */
   public async recordFinishedWindowJobAndMaybeRecyclePage(
     username: string,
     recycleInterval?: number,
     onLog?: (level: 'info' | 'warn' | 'error' | 'success', msg: string) => void,
   ): Promise<void> {
+    await this.saveRotatedSessionFromContext(username)
     this.finishedJobsSinceRecycle += 1
     let interval = recycleInterval
     if (!interval || interval < 1) {
@@ -691,229 +748,187 @@ class StudioBrowserController {
   }
 
   /**
-   * Check whether the right-hand Run Settings panel is currently open and visible.
-   * Note: Gemini 3.8 Flash does NOT have a "Temperature" field in Run Settings —
-   * it shows "Run settings", "System instructions", "Thinking level", "Media resolution", "Output length".
+   * Check whether the right-hand Run Settings panel is currently open and whether its inner
+   * elements (model selector and/or Thinking level dropdown) are visible in the DOM.
+   * IMPORTANT: Never trust `aria-expanded` on `button[aria-label="Toggle run settings panel"]`
+   * because in a new chat the panel is ALREADY OPEN by default while `aria-expanded` may be unset/false.
    */
-  /**
-   * Check whether the right-hand Run Settings panel is currently open and visible on screen in the DOM.
-   * Checks aria-expanded on the toggle button, visible close buttons in the right rail,
-   * visible panel controls, and on-screen container bounds.
-   */
-  private async isRunSettingsPanelOpen(page: Page): Promise<boolean> {
+  private async getRunSettingsPanelState(page: Page): Promise<{
+    open: boolean
+    hasModelSelector: boolean
+    hasThinkingLevel: boolean
+  }> {
     try {
-      return await page.evaluate(() => {
-        const isElementVisibleOnScreen = (el: Element | null): el is HTMLElement => {
-          if (!el) return false
-          const h = el as HTMLElement
-          const r = h.getBoundingClientRect()
-          const style = window.getComputedStyle(h)
-          return (
-            r.width > 25 &&
-            r.height > 25 &&
-            r.right > 0 &&
-            r.left < window.innerWidth &&
-            r.bottom > 0 &&
-            r.top < window.innerHeight &&
-            style.visibility !== 'hidden' &&
-            style.display !== 'none' &&
-            style.opacity !== '0' &&
-            h.getAttribute('aria-hidden') !== 'true'
+      return await page.evaluate(
+        ({ modelSels, thinkSels }) => {
+          const isElementVisibleOnScreen = (el: Element | null): el is HTMLElement => {
+            if (!el) return false
+            const h = el as HTMLElement
+            const r = h.getBoundingClientRect()
+            const style = window.getComputedStyle(h)
+            return (
+              r.width > 20 &&
+              r.height > 14 &&
+              r.right > 0 &&
+              r.left < window.innerWidth &&
+              r.bottom > 0 &&
+              r.top < window.innerHeight &&
+              style.visibility !== 'hidden' &&
+              style.display !== 'none' &&
+              style.opacity !== '0' &&
+              h.getAttribute('aria-hidden') !== 'true'
+            )
+          }
+
+          let hasModelSelector = false
+          for (const sel of modelSels) {
+            try {
+              const nodes = Array.from(document.querySelectorAll(sel))
+              if (nodes.some((n) => isElementVisibleOnScreen(n))) {
+                hasModelSelector = true
+                break
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+
+          let hasThinkingLevel = false
+          for (const sel of thinkSels) {
+            try {
+              const nodes = Array.from(document.querySelectorAll(sel))
+              if (nodes.some((n) => isElementVisibleOnScreen(n))) {
+                hasThinkingLevel = true
+                break
+              }
+            } catch {
+              /* ignore */
+            }
+          }
+
+          if (!hasThinkingLevel) {
+            const all = Array.from(document.body.querySelectorAll('*'))
+            for (const el of all) {
+              if (!isElementVisibleOnScreen(el)) continue
+              if (el.children.length > 2) continue
+              const t = ((el as HTMLElement).innerText || el.textContent || '').trim()
+              if (/^thinking\s*(level|budget)?$/i.test(t)) {
+                hasThinkingLevel = true
+                break
+              }
+            }
+          }
+
+          let hasContainer = false
+          const containers = Array.from(
+            document.querySelectorAll(
+              'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, aside.runsettings-panel, div.runsettings-panel, [class*="runsettings-panel" i], [class*="run-settings-panel" i]',
+            ),
           )
-        }
-
-        // 1. Direct check on toggle button aria attributes (WAI-ARIA standard)
-        const toggleBtn = document.querySelector(
-          'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button, button[aria-label*="Run settings" i]',
-        ) as HTMLElement | null
-
-        if (toggleBtn) {
-          const expanded = toggleBtn.getAttribute('aria-expanded')
-          if (expanded === 'true') return true
-          if (expanded === 'false') return false
-
-          const pressed = toggleBtn.getAttribute('aria-pressed')
-          if (pressed === 'true') return true
-          if (pressed === 'false') return false
-        }
-
-        // 2. Check for Close button inside the panel on screen in the right rail
-        const closeBtns = Array.from(
-          document.querySelectorAll(
-            'button[aria-label*="Close run settings" i], button[aria-label="Close panel" i]',
-          ),
-        )
-        for (const b of closeBtns) {
-          if (isElementVisibleOnScreen(b) && b.getBoundingClientRect().left > window.innerWidth * 0.45) {
-            return true
+          for (const c of containers) {
+            const r = c.getBoundingClientRect()
+            if (isElementVisibleOnScreen(c) && r.left > window.innerWidth * 0.45 && r.width >= 160) {
+              hasContainer = true
+              break
+            }
           }
-        }
 
-        // 3. Check for specific controls inside the panel visible on screen in the right rail
-        const panelControls = Array.from(
-          document.querySelectorAll(
-            'ms-thinking-budget-slider, mat-select[aria-label*="Thinking" i], [data-cmt-row-select="thinking-level"], ms-model-selector',
-          ),
-        )
-        for (const ctrl of panelControls) {
-          const r = (ctrl as HTMLElement).getBoundingClientRect()
-          if (isElementVisibleOnScreen(ctrl) && r.left > window.innerWidth * 0.45 && r.width >= 40) {
-            return true
+          return {
+            open: hasModelSelector || hasThinkingLevel || hasContainer,
+            hasModelSelector,
+            hasThinkingLevel,
           }
-        }
-
-        // 4. Check for panel container docked and visible on screen in the right rail
-        const containers = Array.from(
-          document.querySelectorAll(
-            'ms-run-settings, ms-runsettings, ms-run-settings-panel, ms-runsettings-panel, aside.runsettings-panel, div.runsettings-panel',
-          ),
-        )
-        for (const c of containers) {
-          const r = c.getBoundingClientRect()
-          if (
-            isElementVisibleOnScreen(c) &&
-            r.left > window.innerWidth * 0.45 &&
-            r.left < window.innerWidth &&
-            r.width >= 180
-          ) {
-            return true
-          }
-        }
-
-        return false
-      })
+        },
+        {
+          modelSels: [...STUDIO_SELECTORS.modelSelectorTrigger],
+          thinkSels: [...STUDIO_SELECTORS.thinkingLevelSelect],
+        },
+      )
     } catch {
-      return false
+      return { open: false, hasModelSelector: false, hasThinkingLevel: false }
     }
   }
 
   /**
-   * Dismiss any open dropdown / menu overlay (.cdk-overlay-backdrop) WITHOUT accidentally closing
-   * the Run Settings panel via an unnecessary Escape press.
+   * Dismiss any open dropdown / menu overlay (.cdk-overlay-pane) using Escape ONLY when an overlay is open,
+   * never clicking outside the panel where it could accidentally close the Run Settings panel.
    */
   private async dismissOpenOverlayIfAny(page: Page): Promise<void> {
     try {
-      const closedViaBackdrop = await page.evaluate(() => {
-        const backdrop = document.querySelector('.cdk-overlay-backdrop.cdk-overlay-backdrop-showing') as HTMLElement | null
-        if (backdrop) {
-          backdrop.click()
-          return true
-        }
+      const hasOpenOverlay = await page.evaluate(() => {
         const activeOverlay = document.querySelector(
-          '.cdk-overlay-pane [role="menu"], .cdk-overlay-pane [role="listbox"], .cdk-overlay-pane mat-option',
+          '.cdk-overlay-pane [role="menu"], .cdk-overlay-pane [role="listbox"], .cdk-overlay-pane mat-option, .cdk-overlay-pane [role="option"]',
         ) as HTMLElement | null
-        if (activeOverlay && activeOverlay.getBoundingClientRect().height > 0) {
-          return false // needs Escape
-        }
-        return true // nothing open
+        return Boolean(activeOverlay && activeOverlay.getBoundingClientRect().height > 0)
       })
-      if (!closedViaBackdrop) {
+      if (hasOpenOverlay) {
         await page.keyboard.press('Escape').catch(() => {})
+        await new Promise((r) => setTimeout(r, 200))
       }
-      await new Promise((r) => setTimeout(r, 200))
     } catch {
       /* ignore */
     }
   }
 
   /**
-   * Ensure the right-hand Run Settings panel is open.
-   * New chats have the Run Settings panel closed. Before searching for the dropdown,
-   * clicks button[aria-label="Toggle run settings panel"] to open the panel and
-   * waits until the panel is in the DOM (max ~5s).
+   * Wait for the Run Settings panel elements (model selector, thinking level dropdown) to become
+   * visible after a new chat loads (max ~5s).
+   *
+   * CRITICAL: In a new chat, the Run Settings panel is ALREADY OPEN by default.
+   * Do NOT click `button[aria-label="Toggle run settings panel"]` when the panel is already open,
+   * or it will close the panel!
+   * Only if the panel is genuinely closed after waiting up to ~5s (neither model selector nor
+   * thinking level is visible in DOM), click the toggle button ONCE and verify it opened.
    */
-  private async ensureRunSettingsPanelOpen(page: Page): Promise<boolean> {
-    if (await this.isRunSettingsPanelOpen(page)) return true
-    await new Promise((r) => setTimeout(r, 200))
-    if (await this.isRunSettingsPanelOpen(page)) return true
+  private async waitForRunSettingsPanelElements(page: Page, maxWaitMs = 5000): Promise<{
+    open: boolean
+    hasModelSelector: boolean
+    hasThinkingLevel: boolean
+  }> {
+    const deadline = Date.now() + maxWaitMs
+    while (Date.now() < deadline) {
+      const state = await this.getRunSettingsPanelState(page)
+      if (state.hasThinkingLevel || (state.open && state.hasModelSelector)) {
+        return state
+      }
+      await new Promise((r) => setTimeout(r, 250))
+    }
 
-    await this.dismissOpenOverlayIfAny(page)
-    if (await this.isRunSettingsPanelOpen(page)) return true
+    let state = await this.getRunSettingsPanelState(page)
+    if (state.open) {
+      return state
+    }
 
-    const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2500)
+    // Panel is genuinely closed even after waiting 5s -> click toggle ONCE to open it
+    this.logStep(
+      'opening run settings',
+      'Panel confirmed closed after 5s wait -> clicking Toggle run settings panel once',
+      'info',
+    )
+    const toggle = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 2000)
     if (toggle) {
       await toggle.click().catch(() => {})
     } else {
       await page
         .evaluate(() => {
           const btn = document.querySelector(
-            'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button, button[aria-label*="Run settings" i]',
+            'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button',
           ) as HTMLElement | null
           if (btn) btn.click()
         })
         .catch(() => {})
     }
 
-    // Wait until panel is in the DOM and visible (max ~5s)
-    for (let i = 0; i < 20; i++) {
+    const afterClickDeadline = Date.now() + 5000
+    while (Date.now() < afterClickDeadline) {
       await new Promise((r) => setTimeout(r, 250))
-      if (await this.isRunSettingsPanelOpen(page)) {
-        await new Promise((r) => setTimeout(r, 200))
-        return true
+      state = await this.getRunSettingsPanelState(page)
+      if (state.hasThinkingLevel || state.open) {
+        return state
       }
     }
 
-    // Fallback attempt: if still not open after 5s, try clicking toggle once more
-    const toggleRetry = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runSettingsToggle, 1000)
-    if (toggleRetry) {
-      await toggleRetry.click().catch(() => {})
-      for (let i = 0; i < 12; i++) {
-        await new Promise((r) => setTimeout(r, 250))
-        if (await this.isRunSettingsPanelOpen(page)) {
-          await new Promise((r) => setTimeout(r, 200))
-          return true
-        }
-      }
-    }
-
-    return await this.isRunSettingsPanelOpen(page)
-  }
-
-  /**
-   * Close the Run Settings panel after configuring model & thinking level so it does not cover
-   * the prompt composer or the Run button (as shown at 01:42-01:48 in the user's video).
-   */
-  private async closeRunSettingsPanel(page: Page): Promise<void> {
-    try {
-      await this.dismissOpenOverlayIfAny(page)
-      if (!(await this.isRunSettingsPanelOpen(page))) return
-
-      await page
-        .evaluate(() => {
-          const isVisible = (el: Element | null): el is HTMLElement => {
-            if (!el) return false
-            const h = el as HTMLElement
-            const r = h.getBoundingClientRect()
-            return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
-          }
-
-          // 1. Try the close (X) button at the top-right of the Run settings panel header
-          const closeBtns = Array.from(
-            document.querySelectorAll(
-              'button[aria-label*="Close run settings" i], button[aria-label="Close panel" i], button[aria-label="Close" i]',
-            ),
-          )
-          for (const b of closeBtns) {
-            if (isVisible(b) && b.getBoundingClientRect().left > window.innerWidth * 0.45) {
-              ;(b as HTMLElement).click()
-              return
-            }
-          }
-
-          // 2. Fallback: click the tune toggle button in the top toolbar
-          const toggleBtn = document.querySelector(
-            'button[aria-label="Toggle run settings panel" i], button.runsettings-toggle-button',
-          ) as HTMLElement | null
-          if (toggleBtn && isVisible(toggleBtn)) {
-            toggleBtn.click()
-          }
-        })
-        .catch(() => {})
-
-      await new Promise((r) => setTimeout(r, 350))
-    } catch {
-      /* ignore */
-    }
+    return await this.getRunSettingsPanelState(page)
   }
 
   /**
@@ -937,7 +952,11 @@ class StudioBrowserController {
           for (const node of nodes) {
             if (!isVisible(node)) continue
             const t = (node.innerText || node.textContent || '').trim().replace(/\s+/g, ' ')
-            if (t && !isWelcomeHeading(t) && (/gemini/i.test(t) || /3\.8/i.test(t) || /2\.5/i.test(t))) {
+            if (
+              t &&
+              !isWelcomeHeading(t) &&
+              (/gemini/i.test(t) || /3\.[678]/i.test(t) || /2\.5/i.test(t))
+            ) {
               return t
             }
           }
@@ -968,7 +987,7 @@ class StudioBrowserController {
           if (!t || isWelcomeHeading(t)) continue
           if (
             /^gemini[\s-]+\d+(\.\d+)?/i.test(t) ||
-            /\bgemini[\s-]+3\.8\b/i.test(t) ||
+            /\bgemini[\s-]+3\.[678]\b/i.test(t) ||
             /\bgemini[\s-]+2\.5\b/i.test(t)
           ) {
             return t
@@ -979,6 +998,103 @@ class StudioBrowserController {
     } catch {
       return ''
     }
+  }
+
+  /**
+   * Select a specific model (e.g. "Gemini 3.8 Flash", "Gemini 3.7 Flash", "Gemini 3.6 Flash")
+   * in the Run Settings panel if it is not already selected.
+   */
+  private async selectModelInRunSettings(page: Page, targetModelName: string): Promise<string> {
+    const desired = (targetModelName || 'Gemini 3.8 Flash').trim()
+    const versionMatch = desired.match(/(\d+\.\d+)/)
+    const desiredVersion = versionMatch ? versionMatch[1] : ''
+    const isFlash = /flash/i.test(desired)
+
+    const matchesDesired = (text: string): boolean => {
+      if (!text) return false
+      if (desiredVersion) {
+        const hasVer = text.includes(desiredVersion)
+        const hasVariant = !isFlash || /flash/i.test(text)
+        return hasVer && hasVariant
+      }
+      return text.toLowerCase().includes(desired.toLowerCase())
+    }
+
+    const currentCardText = await this.readVisibleModelCardText(page)
+    if (matchesDesired(currentCardText)) {
+      return currentCardText
+    }
+
+    // If default 3.8 Flash was requested and some default model is already loaded, keep it unless fallback was requested
+    if (!desiredVersion || desiredVersion === '3.8') {
+      if (!currentCardText || matchesDesired(currentCardText)) {
+        return currentCardText || desired
+      }
+    }
+
+    this.logStep('selecting model', `Switching model to "${desired}" (current="${currentCardText || 'default'}")`, 'info')
+
+    const trigger = await findFirstVisibleLocator(page, STUDIO_SELECTORS.modelSelectorTrigger, 2500)
+    if (trigger) {
+      await trigger.click().catch(() => {})
+      await new Promise((r) => setTimeout(r, 450))
+
+      const clickedModel = await page
+        .evaluate(
+          ({ ver, wantFlash, fullLabel }) => {
+            const isVisible = (el: Element | null): el is HTMLElement => {
+              if (!el) return false
+              const h = el as HTMLElement
+              const r = h.getBoundingClientRect()
+              return r.width > 0 && r.height > 0 && window.getComputedStyle(h).visibility !== 'hidden'
+            }
+
+            // Search inside overlay panes / model picker lists first
+            const roots = Array.from(
+              document.querySelectorAll(
+                '.cdk-overlay-pane, mat-dialog-container, [role="listbox"], [role="menu"], ms-model-carousel, [class*="model-list" i], [class*="model-picker" i]',
+              ),
+            ).filter((el) => isVisible(el))
+
+            const candidates: HTMLElement[] = []
+            for (const root of roots) {
+              root
+                .querySelectorAll(
+                  'mat-option, [role="option"], [role="menuitem"], button, [class*="model-card" i], [class*="model-item" i], [class*="model-row" i]',
+                )
+                .forEach((n) => {
+                  if (isVisible(n)) candidates.push(n as HTMLElement)
+                })
+            }
+
+            for (const c of candidates) {
+              const txt = (c.innerText || c.textContent || '').trim().replace(/\s+/g, ' ')
+              if (!txt) continue
+              if (ver) {
+                if (txt.includes(ver) && (!wantFlash || /flash/i.test(txt)) && !/lite/i.test(txt)) {
+                  c.click()
+                  return txt
+                }
+              } else if (txt.toLowerCase().includes(fullLabel.toLowerCase())) {
+                c.click()
+                return txt
+              }
+            }
+            return null
+          },
+          { ver: desiredVersion, wantFlash: isFlash, fullLabel: desired },
+        )
+        .catch(() => null)
+
+      await new Promise((r) => setTimeout(r, 400))
+      await this.dismissOpenOverlayIfAny(page)
+
+      const updatedCardText = (await this.readVisibleModelCardText(page)) || clickedModel || desired
+      this.logStep('model selected', `Active model in Run Settings: ${updatedCardText}`, 'info')
+      return updatedCardText
+    }
+
+    return currentCardText || desired
   }
 
   /**
@@ -1106,9 +1222,13 @@ class StudioBrowserController {
   }
 
   /**
-   * Step (b): Open Run Settings panel -> set Thinking level = High -> read back and verify "High"
-   * (with 2-attempt retry) -> set max output tokens -> close the Run Settings panel.
-   * Model selection and Media Resolution stay at AI Studio defaults (Gemini 3.8 Flash / default mediaRes).
+   * Step (b):
+   * - In a new chat, the Run Settings panel (tune / three-dot panel) is ALREADY OPEN by default.
+   * - Do NOT click `button[aria-label="Toggle run settings panel"]` on new chat load (doing so closes the panel!).
+   * - Flow: wait for panel elements (model selector, thinking level dropdown) to appear (max ~5s) ->
+   *   select model (or fallback model) and set Thinking = High directly.
+   * - Never click outside the panel while configuring. After dropdown selection, verify the panel is still open.
+   * - If the dropdown is still not found, log "not found" along with the current panel state (open/closed).
    */
   private async configureRunSettings(
     page: Page,
@@ -1117,31 +1237,30 @@ class StudioBrowserController {
   ) {
     await this.waitIfPausedOrThrowIfStopped(scope)
 
-    // 0. New chats have the Run Settings panel closed. Before searching for the dropdown,
-    // check if panel is open; if closed, click button[aria-label="Toggle run settings panel"]
-    // and wait until the panel is in the DOM (max ~5s), then search for dropdown.
-    let panelOpened = await this.isRunSettingsPanelOpen(page)
-    if (!panelOpened) {
-      this.logStep('opening run settings', 'Panel closed in chat -> clicking toggle and waiting for DOM (max ~5s)', 'info')
-      panelOpened = await this.ensureRunSettingsPanelOpen(page)
-    }
-    if (!panelOpened) {
-      await this.dumpRunSettingsPanelDiagnostics(page, 'Run settings panel did not open after toggle click')
-      throw new Error('Studio thinking level config failed: Run settings panel could not be opened')
+    // 0. Wait up to ~5s for the already-open Run Settings panel elements to appear in DOM.
+    // Only clicks Toggle run settings panel ONCE if the panel is genuinely closed after waiting.
+    const initialPanelState = await this.waitForRunSettingsPanelElements(page, 5000)
+    if (!initialPanelState.open) {
+      const stateLabel = initialPanelState.open ? 'khula (open)' : 'band (closed)'
+      await this.dumpRunSettingsPanelDiagnostics(
+        page,
+        `Run settings panel not open after wait (panel=${stateLabel})`,
+      )
+      throw new Error(
+        `Studio thinking level config failed: Run settings panel not found (panel=${stateLabel})`,
+      )
     }
 
-    // 1. Set "Thinking level" dropdown to High & READ BACK visible value
+    // 1. Select requested or fallback model (e.g. Gemini 3.8 Flash, 3.7 Flash, 3.6 Flash)
+    const activeModelText = await this.selectModelInRunSettings(page, config.modelName)
+
+    // 2. Set "Thinking level" dropdown to High & READ BACK visible value
     let verifiedThinkingText = ''
     let thinkingConfigError = ''
 
     for (let thinkAttempt = 1; thinkAttempt <= 2; thinkAttempt++) {
       await this.waitIfPausedOrThrowIfStopped(scope)
       thinkingConfigError = ''
-
-      // Confirm panel is open in DOM before attempting dropdown interaction
-      if (!(await this.isRunSettingsPanelOpen(page))) {
-        await this.ensureRunSettingsPanelOpen(page)
-      }
 
       // If there is a Thinking mode toggle switch that is currently unchecked, enable it first
       try {
@@ -1157,7 +1276,7 @@ class StudioBrowserController {
         /* ignore */
       }
 
-      // Search for dropdown with 3000ms locator timeout now that panel is open
+      // Search for Thinking level dropdown inside the open Run Settings panel
       let thinkSelect = await findFirstVisibleLocator(page, STUDIO_SELECTORS.thinkingLevelSelect, 3000)
       if (!thinkSelect) {
         const markedThink = await this.markRowDropdownByLabel(
@@ -1171,8 +1290,9 @@ class StudioBrowserController {
       }
 
       if (!thinkSelect || (await thinkSelect.count()) === 0) {
-        thinkingConfigError = 'Thinking level dropdown selector not found in Run settings panel'
-        // Dump diagnostics ONLY on attempt 2 to eliminate noise
+        const pState = await this.getRunSettingsPanelState(page)
+        const stateDesc = pState.open ? 'khula (open)' : 'band (closed)'
+        thinkingConfigError = `Thinking level dropdown selector not found (panel=${stateDesc}, modelSelector=${pState.hasModelSelector}, thinkingLevel=${pState.hasThinkingLevel})`
         if (thinkAttempt >= 2) {
           await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
         }
@@ -1183,9 +1303,10 @@ class StudioBrowserController {
           await thinkSelect.click().catch(() => {})
           await new Promise((r) => setTimeout(r, 350))
 
+          // Click "High" strictly inside the opened overlay pane so we never click outside the panel
           const highOpt = page
             .locator(
-              'mat-option:has-text("High"), [role="option"]:has-text("High"), [role="menuitem"]:has-text("High"), .cdk-overlay-pane :text-is("High")',
+              '.cdk-overlay-pane mat-option:has-text("High"), .cdk-overlay-pane [role="option"]:has-text("High"), .cdk-overlay-pane [role="menuitem"]:has-text("High"), mat-option:has-text("High"), [role="option"]:has-text("High")',
             )
             .first()
 
@@ -1193,7 +1314,9 @@ class StudioBrowserController {
             await highOpt.click().catch(() => {})
             await new Promise((r) => setTimeout(r, 350))
           } else {
-            thinkingConfigError = '"High" option not found after opening Thinking level dropdown'
+            const pState = await this.getRunSettingsPanelState(page)
+            const stateDesc = pState.open ? 'khula (open)' : 'band (closed)'
+            thinkingConfigError = `"High" option not found after opening Thinking level dropdown (panel=${stateDesc})`
             if (thinkAttempt >= 2) {
               await this.dumpRunSettingsPanelDiagnostics(page, `${thinkingConfigError} (attempt ${thinkAttempt}/2)`)
             }
@@ -1201,27 +1324,28 @@ class StudioBrowserController {
           }
         }
 
+        // Verify panel is still open after dropdown selection (do not toggle if closed, just check state)
+        const postSelectState = await this.getRunSettingsPanelState(page)
         const readBackThink = await this.readVisibleThinkingLevelText(page)
         if (/\bhigh\b/i.test(readBackThink)) {
           verifiedThinkingText = readBackThink
           break
         }
         if (!thinkingConfigError) {
-          thinkingConfigError = `expected "High", read back "${readBackThink || 'empty'}"`
+          const stateDesc = postSelectState.open ? 'khula (open)' : 'band (closed)'
+          thinkingConfigError = `expected "High", read back "${readBackThink || 'empty'}" (panel=${stateDesc})`
         }
         if (thinkAttempt >= 2) {
           await this.dumpRunSettingsPanelDiagnostics(page, `thinking level read-back mismatch: ${thinkingConfigError}`)
         }
       }
 
-      if (thinkAttempt < 2 && thinkingConfigError) {
-        this.logStep(`thinking retry ${thinkAttempt}/2`, thinkingConfigError, 'warn')
-      } else if (thinkAttempt >= 2 && thinkingConfigError) {
+      if (thinkAttempt >= 2 && thinkingConfigError) {
         throw new Error(`Studio thinking level config failed: ${thinkingConfigError}`)
       }
     }
 
-    // 2. Ensure Advanced Settings is expanded if needed for Output length (do not collapse if already expanded)
+    // 3. Ensure Advanced Settings is expanded if needed for Output length (do not collapse if already expanded)
     try {
       const outputLengthVisible = await page
         .evaluate(() => /output\s+length/i.test(document.body.innerText || ''))
@@ -1241,7 +1365,7 @@ class StudioBrowserController {
       /* ignore */
     }
 
-    // 3. Set Output length (maxOutputTokens) if needed
+    // 4. Set Output length (maxOutputTokens) if needed
     try {
       const maxOutInput = await findFirstVisibleLocator(page, STUDIO_SELECTORS.maxOutputTokensInput, 1200)
       if (maxOutInput) {
@@ -1257,22 +1381,23 @@ class StudioBrowserController {
       /* ignore */
     }
 
-    // Final read-back verification before closing Run Settings panel
+    // Final read-back verification (keep Run Settings panel open — do NOT click Toggle run settings panel)
     const finalThinkingReadBack = (await this.readVisibleThinkingLevelText(page)) || verifiedThinkingText
     if (!/\bhigh\b/i.test(finalThinkingReadBack)) {
+      const pState = await this.getRunSettingsPanelState(page)
+      const stateDesc = pState.open ? 'khula (open)' : 'band (closed)'
       await this.dumpRunSettingsPanelDiagnostics(
         page,
-        `final thinking read-back check failed: "${finalThinkingReadBack}"`,
+        `final thinking read-back check failed: "${finalThinkingReadBack}" (panel=${stateDesc})`,
       )
-      throw new Error(`Studio thinking level config failed: expected "High", read back "${finalThinkingReadBack || 'empty'}"`)
+      throw new Error(
+        `Studio thinking level config failed: expected "High", read back "${finalThinkingReadBack || 'empty'}" (panel=${stateDesc})`,
+      )
     }
-
-    // 4. Close the Run Settings panel so the prompt box and Run button are uncovered
-    await this.closeRunSettingsPanel(page)
 
     this.logStep(
       'model set',
-      'thinking=High · model/mediaRes=default',
+      `thinking=High · model=${activeModelText || config.modelName || 'default'}`,
       'success',
     )
   }
@@ -2536,18 +2661,58 @@ class StudioBrowserController {
   }
 
   /**
+   * Read any visible toast / snackbar / alert text on the AI Studio page (e.g. when Run fails with 403).
+   */
+  private async readPageToastOrErrorText(page: Page): Promise<string> {
+    try {
+      return await page.evaluate(() => {
+        const selectors = [
+          'mat-snack-bar-container',
+          'simple-snack-bar',
+          '.mat-mdc-snack-bar-container',
+          '.cdk-overlay-container [role="status"]',
+          '.cdk-overlay-container [role="alert"]',
+          '[role="alert"]',
+          '.error-message',
+          '.mat-mdc-snack-bar-label',
+        ]
+        const parts: string[] = []
+        for (const sel of selectors) {
+          try {
+            const nodes = Array.from(document.querySelectorAll(sel))
+            for (const n of nodes) {
+              const el = n as HTMLElement
+              const r = el.getBoundingClientRect()
+              if (r.width <= 0 || r.height <= 0) continue
+              const txt = (el.innerText || el.textContent || '').trim().replace(/\s+/g, ' ')
+              if (txt && !parts.includes(txt)) {
+                parts.push(txt)
+              }
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+        return parts.join(' | ').slice(0, 500)
+      })
+    } catch {
+      return ''
+    }
+  }
+
+  /**
    * Execute a single (shortPart, movieBlock) Studio job:
    * a. Open a NEW chat on aistudio.google.com
-   * b. Configure Run Settings (thinking=High, maxOutputTokens; model & mediaRes stay default)
+   * b. Configure Run Settings (thinking=High, maxOutputTokens, model fallback selection if triggered)
    * c. Attach Video 1 (short part) & Video 2 (movie_360p), set start/end times + FPS=24 (verified read-back + 10s wait after Save)
    * d. Paste prompt text and check token counter BEFORE pressing Run:
    *    - If > maxInputTokens (1_048_576 - maxOutputTokens - 5_000, or user override), signal shrink_needed
    *    - Never run the shrink check after pressing Run (during generation the counter can include output tokens)
    *    - Keep the implausibly low token counter check (minimum 500 tokens/sec of video)
    *    - Wait 10s after token counter settles before pressing Run
-   * e. Press Run -> wait up to 10m -> check permission denied first (own 5-retry counter) -> detect completion via STOP_GONE | HISSA_FOUND | STABLE_6S
+   * e. Press Run -> capture GenerateContent network response (status + body) & page toast -> wait up to 10m -> check permission denied first (own 5-retry counter + model fallback 3.8 -> 3.7 -> 3.6 Flash) -> detect completion via STOP_GONE | HISSA_FOUND | STABLE_6S
    * f. Fetch final answer via turn "Copy as text" (or DOM fallback) -> synchronously validate with validateStudioAnswer (retry up to 3x in new chat if invalid) -> calibrate offset mode -> parseChunkMatches
-   * g. Recycle Playwright page in same persistent context after every N finished window jobs (default 5)
+   * g. Save rotated cookies/profile & recycle Playwright page in same persistent context after every N finished window jobs (default 5)
    */
   public async runWindowJob(params: {
     username: string
@@ -2620,13 +2785,18 @@ class StudioBrowserController {
     const MAX_INVALID_RESULT_RETRIES = 3
     let invalidResultRetries = 0
 
+    // Model fallback chain when 403 PERMISSION_DENIED occurs on Run
+    const MODEL_FALLBACK_CHAIN = ['Gemini 3.8 Flash', 'Gemini 3.7 Flash', 'Gemini 3.6 Flash']
+    let activeModelIndex = 0
+    let activeModelName = modelName || MODEL_FALLBACK_CHAIN[0]
+
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       await this.waitIfPausedOrThrowIfStopped(scope)
       const page = await this.ensurePage(username)
 
       try {
         // (a) Open a NEW chat on aistudio.google.com
-        this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS})`)
+        this.logStep('opening new chat', `${jobLabel} (attempt ${attempt}/${MAX_ATTEMPTS}, model=${activeModelName})`)
         await page.goto(STUDIO_URLS.newChat, {
           waitUntil: 'domcontentloaded',
           timeout: 45_000,
@@ -2636,12 +2806,12 @@ class StudioBrowserController {
 
         if (page.url().includes('accounts.google.com')) {
           throw new Error(
-            'Google session logged out or requires verification. Open "Gemini Studio Live" -> Login Assist or paste fresh cookies in Settings.',
+            'Google session logged out or requires verification. Open "Gemini Studio Live" -> Login Assist or log in once in the persistent Chrome profile.',
           )
         }
 
-        // (b) Configure thinking High, max output tokens (model and media resolution stay default)
-        await this.configureRunSettings(page, { modelName, maxOutputTokens }, scope)
+        // (b) Configure Run Settings (panel is already open in new chat: wait for elements, select model/fallback model, set Thinking=High)
+        await this.configureRunSettings(page, { modelName: activeModelName, maxOutputTokens }, scope)
 
         // (c) Attach Video 1 = short part & Video 2 = movie_360p, set start/end & 24 FPS (waits 10s after each Save)
         await this.attachVideoAndConfigureRange(page, {
@@ -2739,6 +2909,7 @@ class StudioBrowserController {
           const msg = `Studio token counter is ${(tokens / 1000).toFixed(0)}K (> ${(effectiveMaxInputTokens / 1000).toFixed(0)}K limit [${effectiveMaxInputTokens.toLocaleString()}]) for ${jobLabel} — shrinking movie block and retrying`
           this.logStep('shrinking block', msg, 'warn')
           onLog?.('warn', msg)
+          await this.saveRotatedSessionFromContext(username)
           return {
             status: 'shrink_needed',
             tokenCount: tokens,
@@ -2749,21 +2920,33 @@ class StudioBrowserController {
         // Wait 10 seconds after the prompt is pasted and the token counter has settled, then press Run
         await new Promise((r) => setTimeout(r, 10_000))
 
-        // (e) Press Run
-        const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
-        if (runBtn) {
-          await runBtn.click()
-        } else {
-          await promptInput.press('Control+Enter')
+        // Attach network response listener BEFORE pressing Run so we capture exact GenerateContent status + body on 403/errors
+        let capturedRunError: { status: number; url: string; body: string } | null = null
+        const onRunResponse = async (res: PlaywrightResponse) => {
+          try {
+            const url = res.url()
+            const status = res.status()
+            const isGenApi =
+              /GenerateContent|StreamGenerateContent|MakerSuiteService|alkali|generativelanguage|batchexecute|aistudio\.google\.com\/_\//i.test(
+                url,
+              )
+            if (!isGenApi && status < 400) return
+            if (status >= 400 || /GenerateContent|MakerSuiteService|alkali/i.test(url)) {
+              const text = await res.text().catch(() => '')
+              if (
+                status >= 400 ||
+                /PERMISSION_DENIED|caller does not have permission|"error"\s*:/i.test(text)
+              ) {
+                const compactBody = text.replace(/\s+/g, ' ').trim().slice(0, 600)
+                capturedRunError = { status, url, body: compactBody }
+              }
+            }
+          } catch {
+            /* ignore response read race */
+          }
         }
+        page.on('response', onRunResponse)
 
-        // CHANGE 1 & CHANGE 2: Poll every 1 s up to 10-min timeout.
-        // 1) Check permission denied FIRST (highest priority).
-        // 2) Check error banners (internal error / something went wrong / failed to generate route straight to CHANGE 5 retry).
-        // 3) Check 3 independent done indicators (no Run-button-enabled requirement):
-        //    A) STOP_GONE: Stop button was seen at least once, and now Stop is hidden + scoped spinner is gone for 2 consecutive polls
-        //    B) HISSA_FOUND: candidateText contains both HISSA 1 and HISSA 2, and (!stopVisible || stableSeconds >= 3)
-        //    C) STABLE_6S: candidateText is non-empty and unchanged for 6 consecutive seconds
         const runStarted = Date.now()
         const TIMEOUT_MS = 10 * 60_000
         let rawAnswer = ''
@@ -2775,141 +2958,194 @@ class StudioBrowserController {
         let permissionDeniedTriggered = false
         let transientBannerReason: string | null = null
 
-        while (Date.now() - runStarted < TIMEOUT_MS) {
-          await this.waitIfPausedOrThrowIfStopped(scope)
-
-          // Priority 1: Check page text for permission denied as soon as Run is pressed and throughout the run
-          const hasPermissionDenied = await page
-            .evaluate(() => {
-              const bodyText = document.body?.innerText || ''
-              return /failed to generate content[\s\S]{0,80}permission denied|caller does not have permission/i.test(
-                bodyText,
-              )
-            })
-            .catch(() => false)
-
-          if (hasPermissionDenied) {
-            permissionDeniedRetries += 1
-            this.logStep(
-              'permission denied - retrying',
-              `${jobLabel} (permission retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES})`,
-              'warn',
-            )
-            onLog?.(
-              'warn',
-              `AI Studio permission denied on ${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — waiting 5s and retrying in a new chat`,
-            )
-            if (permissionDeniedRetries > MAX_PERMISSION_RETRIES) {
-              throw new Error(
-                `PERMISSION_DENIED_EXHAUSTED: AI Studio failed to generate content (permission denied / caller does not have permission) after ${MAX_PERMISSION_RETRIES} permission retries on ${jobLabel}`,
-              )
-            }
-            await new Promise((r) => setTimeout(r, 5000))
-            permissionDeniedTriggered = true
-            break
+        try {
+          // (e) Press Run
+          const runBtn = await findFirstVisibleLocator(page, STUDIO_SELECTORS.runButton, 4000)
+          if (runBtn) {
+            await runBtn.click()
+          } else {
+            await promptInput.press('Control+Enter')
           }
 
-          const elapsed = Math.floor((Date.now() - runStarted) / 1000)
-          const mm = String(Math.floor(elapsed / 60)).padStart(2, '0')
-          const ss = String(elapsed % 60).padStart(2, '0')
-          this.logStep(`running ${mm}:${ss}`, jobLabel)
+          // Poll every 1 s up to 10-min timeout.
+          while (Date.now() - runStarted < TIMEOUT_MS) {
+            await this.waitIfPausedOrThrowIfStopped(scope)
 
-          // Error/quota/alert banner detection (real alert/banner containers + specific phrases only)
-          const errBannerText = await page.evaluate((sels) => {
-            const strictRegex =
-              /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
-            for (const s of sels) {
-              if (s.includes(':has-text(')) continue
-              try {
-                const nodes = Array.from(document.querySelectorAll(s))
-                for (const node of nodes) {
-                  const el = node as HTMLElement
-                  if (!el || !el.innerText) continue
-                  const visible = el.offsetParent !== null || el.getClientRects().length > 0
-                  if (!visible) continue
-                  const t = el.innerText.trim()
-                  if (strictRegex.test(t)) {
-                    return t
-                  }
-                }
-              } catch {
-                // ignore invalid selector
+            // Priority 1: Check network response + page text for 403 PERMISSION_DENIED as soon as Run is pressed
+            const domPermissionDenied = await page
+              .evaluate(() => {
+                const bodyText = document.body?.innerText || ''
+                return /failed to generate content[\s\S]{0,80}permission denied|caller does not have permission/i.test(
+                  bodyText,
+                )
+              })
+              .catch(() => false)
+
+            const netPermissionDenied =
+              capturedRunError !== null &&
+              (capturedRunError.status === 403 ||
+                /PERMISSION_DENIED|caller does not have permission/i.test(capturedRunError.body))
+
+            if (domPermissionDenied || netPermissionDenied) {
+              // Give network response body a brief moment to settle if DOM fired first
+              if (!capturedRunError) {
+                await new Promise((r) => setTimeout(r, 400))
               }
-            }
-            return null
-          }, [...STUDIO_SELECTORS.errorBanners])
+              const toastText = await this.readPageToastOrErrorText(page)
+              const statusLabel = capturedRunError?.status || 403
+              const bodySnippet =
+                capturedRunError?.body ||
+                toastText ||
+                'The caller does not have permission (no response body captured)'
+              const exactErrLog = `ERROR [run] ${statusLabel} PERMISSION_DENIED: ${bodySnippet}${
+                toastText && !bodySnippet.includes(toastText) ? ` | Toast: ${toastText}` : ''
+              } (model=${activeModelName})`
 
-          if (errBannerText) {
-            this.logStep('error banner', errBannerText.slice(0, 180), 'warn')
-            onLog?.('warn', `Matched AI Studio error banner on ${jobLabel}: "${errBannerText.slice(0, 200)}"`)
-            if (/(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(errBannerText) && !sanitized) {
+              this.logStep('ERROR [run] 403 PERMISSION_DENIED', exactErrLog, 'error')
+              onLog?.('error', `${exactErrLog} on ${jobLabel}`)
+
+              permissionDeniedRetries += 1
+
+              // Model fallback: advance to next model in MODEL_FALLBACK_CHAIN (3.8 Flash -> 3.7 Flash -> 3.6 Flash)
+              const prevModel = activeModelName
+              if (activeModelIndex + 1 < MODEL_FALLBACK_CHAIN.length) {
+                activeModelIndex += 1
+              } else {
+                activeModelIndex = (activeModelIndex + 1) % MODEL_FALLBACK_CHAIN.length
+              }
+              activeModelName = MODEL_FALLBACK_CHAIN[activeModelIndex]
+
+              this.logStep(
+                'permission denied - retrying',
+                `${jobLabel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) -> model fallback: ${prevModel} -> ${activeModelName}`,
+                'warn',
+              )
               onLog?.(
                 'warn',
-                `Studio flagged content policy on ${jobLabel} — retrying once with sanitized neutral prompt`,
+                `AI Studio 403 PERMISSION_DENIED on ${jobLabel} with ${prevModel} (retry ${permissionDeniedRetries}/${MAX_PERMISSION_RETRIES}) — switching model to "${activeModelName}" and retrying in a new chat`,
               )
-              return this.runWindowJob({ ...params, sanitized: true })
-            }
-            if (/(internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(errBannerText)) {
-              transientBannerReason = `error_banner:${errBannerText.slice(0, 80)}`
-              break
-            }
-            throw new Error(`AI Studio banner error: ${errBannerText.slice(0, 180)}`)
-          }
 
-          const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
-          const stopVisible = Boolean(stopLoc)
-          if (stopVisible) {
-            stopEverSeen = true
-          }
-
-          if (elapsed >= 2) {
-            const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
-            const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
-
-            if (candidateText.length > 0) {
-              if (candidateText === lastCandidateText) {
-                stableSeconds += 1
-              } else {
-                lastCandidateText = candidateText
-                stableSeconds = 1
+              if (permissionDeniedRetries > MAX_PERMISSION_RETRIES) {
+                throw new Error(
+                  `PERMISSION_DENIED_EXHAUSTED: ${exactErrLog} after ${MAX_PERMISSION_RETRIES} permission retries on ${jobLabel}`,
+                )
               }
-            } else {
-              stableSeconds = 0
-            }
-
-            if (stopEverSeen && !stopVisible && !spinnerVisible) {
-              stopGoneConsecutivePolls += 1
-            } else {
-              stopGoneConsecutivePolls = 0
-            }
-
-            // Indicator A: STOP_GONE (Stop was seen at least once, now Stop + scoped spinner are gone for 2 consecutive polls)
-            if (stopEverSeen && !stopVisible && !spinnerVisible && stopGoneConsecutivePolls >= 2) {
-              doneIndicator = 'STOP_GONE'
-            }
-            // Indicator B: HISSA_FOUND (both HISSA 1 and HISSA 2 present in answer text, and Stop is gone OR text unchanged for 3s)
-            else if (
-              /HISSA\s*1\b/i.test(candidateText) &&
-              /HISSA\s*2\b/i.test(candidateText) &&
-              (!stopVisible || stableSeconds >= 3)
-            ) {
-              doneIndicator = 'HISSA_FOUND'
-            }
-            // Indicator C: STABLE_6S (answer text is non-empty and unchanged for 6 consecutive seconds)
-            else if (candidateText.length > 0 && stableSeconds >= 6) {
-              doneIndicator = 'STABLE_6S'
-            }
-
-            if (doneIndicator) {
-              this.logStep(`done by ${doneIndicator}`, jobLabel, 'success')
+              await new Promise((r) => setTimeout(r, 5000))
+              permissionDeniedTriggered = true
               break
             }
-          }
 
-          await new Promise((r) => setTimeout(r, 1000))
+            const elapsed = Math.floor((Date.now() - runStarted) / 1000)
+            const mm = String(Math.floor(elapsed / 60)).padStart(2, '0')
+            const ss = String(elapsed % 60).padStart(2, '0')
+            this.logStep(`running ${mm}:${ss}`, `${jobLabel} [${activeModelName}]`)
+
+            // Error/quota/alert banner detection (real alert/banner containers + specific phrases only)
+            const errBannerText = await page.evaluate((sels) => {
+              const strictRegex =
+                /(quota\s+exceeded|resource[_\s]+exhausted|rate\s+limit|try\s+again\s+later|prohibited_content|blocked\s+due\s+to\s+safety|internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i
+              for (const s of sels) {
+                if (s.includes(':has-text(')) continue
+                try {
+                  const nodes = Array.from(document.querySelectorAll(s))
+                  for (const node of nodes) {
+                    const el = node as HTMLElement
+                    if (!el || !el.innerText) continue
+                    const visible = el.offsetParent !== null || el.getClientRects().length > 0
+                    if (!visible) continue
+                    const t = el.innerText.trim()
+                    if (strictRegex.test(t)) {
+                      return t
+                    }
+                  }
+                } catch {
+                  // ignore invalid selector
+                }
+              }
+              return null
+            }, [...STUDIO_SELECTORS.errorBanners])
+
+            if (errBannerText) {
+              const netDetail = capturedRunError
+                ? ` | HTTP ${capturedRunError.status}: ${capturedRunError.body}`
+                : ''
+              this.logStep('error banner', `${errBannerText.slice(0, 180)}${netDetail}`, 'warn')
+              onLog?.(
+                'warn',
+                `Matched AI Studio error banner on ${jobLabel}: "${errBannerText.slice(0, 200)}"${netDetail}`,
+              )
+              if (/(prohibited_content|blocked\s+due\s+to\s+safety)/i.test(errBannerText) && !sanitized) {
+                onLog?.(
+                  'warn',
+                  `Studio flagged content policy on ${jobLabel} — retrying once with sanitized neutral prompt`,
+                )
+                return this.runWindowJob({ ...params, sanitized: true })
+              }
+              if (/(internal\s+error|something\s+went\s+wrong|failed\s+to\s+generate)/i.test(errBannerText)) {
+                transientBannerReason = `error_banner:${errBannerText.slice(0, 80)}`
+                break
+              }
+              throw new Error(`AI Studio banner error: ${errBannerText.slice(0, 180)}${netDetail}`)
+            }
+
+            const stopLoc = await findFirstVisibleLocator(page, STUDIO_SELECTORS.stopButton, 100)
+            const stopVisible = Boolean(stopLoc)
+            if (stopVisible) {
+              stopEverSeen = true
+            }
+
+            if (elapsed >= 2) {
+              const spinnerVisible = await this.isThinkingOrRunningSpinnerVisible(page)
+              const candidateText = await this.extractFinalAnswerWithoutThoughts(page)
+
+              if (candidateText.length > 0) {
+                if (candidateText === lastCandidateText) {
+                  stableSeconds += 1
+                } else {
+                  lastCandidateText = candidateText
+                  stableSeconds = 1
+                }
+              } else {
+                stableSeconds = 0
+              }
+
+              if (stopEverSeen && !stopVisible && !spinnerVisible) {
+                stopGoneConsecutivePolls += 1
+              } else {
+                stopGoneConsecutivePolls = 0
+              }
+
+              // Indicator A: STOP_GONE (Stop was seen at least once, now Stop + scoped spinner are gone for 2 consecutive polls)
+              if (stopEverSeen && !stopVisible && !spinnerVisible && stopGoneConsecutivePolls >= 2) {
+                doneIndicator = 'STOP_GONE'
+              }
+              // Indicator B: HISSA_FOUND (both HISSA 1 and HISSA 2 present in answer text, and Stop is gone OR text unchanged for 3s)
+              else if (
+                /HISSA\s*1\b/i.test(candidateText) &&
+                /HISSA\s*2\b/i.test(candidateText) &&
+                (!stopVisible || stableSeconds >= 3)
+              ) {
+                doneIndicator = 'HISSA_FOUND'
+              }
+              // Indicator C: STABLE_6S (answer text is non-empty and unchanged for 6 consecutive seconds)
+              else if (candidateText.length > 0 && stableSeconds >= 6) {
+                doneIndicator = 'STABLE_6S'
+              }
+
+              if (doneIndicator) {
+                this.logStep(`done by ${doneIndicator}`, `${jobLabel} [${activeModelName}]`, 'success')
+                break
+              }
+            }
+
+            await new Promise((r) => setTimeout(r, 1000))
+          }
+        } finally {
+          page.off('response', onRunResponse)
         }
 
         if (permissionDeniedTriggered) {
+          await this.saveRotatedSessionFromContext(username)
           // Do NOT consume normal MAX_ATTEMPTS = 3; open a new chat at the top of the loop and redo the same job
           attempt -= 1
           continue
@@ -3015,11 +3251,11 @@ class StudioBrowserController {
           shortEndSec,
           movieStartSec,
           movieEndSec,
-          modelName,
+          modelName: activeModelName,
           onLog,
         })
 
-        // Item 5: Page recycling after every N finished window jobs (success or failed)
+        // Item 5: Page recycling after every N finished window jobs (success or failed) + rotated cookie persistence
         await this.recordFinishedWindowJobAndMaybeRecyclePage(
           username,
           effectiveRecycleInterval,
@@ -3034,10 +3270,10 @@ class StudioBrowserController {
             ? `found ${calibrated.matches.length} matches`
             : 'not found (no matches in this window)'
 
-        this.logStep('SUCCESS [runWindowJob]', `${jobLabel}: ${matchSummary}`, 'success')
+        this.logStep('SUCCESS [runWindowJob]', `${jobLabel} [${activeModelName}]: ${matchSummary}`, 'success')
         onLog?.(
           'success',
-          `SUCCESS [runWindowJob] ${jobLabel}: ${matchSummary} (${tokens || fallbackTokens24Fps} tokens)`,
+          `SUCCESS [runWindowJob] ${jobLabel} [${activeModelName}]: ${matchSummary} (${tokens || fallbackTokens24Fps} tokens)`,
         )
 
         return {

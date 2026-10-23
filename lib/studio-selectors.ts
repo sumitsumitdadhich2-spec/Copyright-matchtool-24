@@ -30,14 +30,15 @@ export const STUDIO_SELECTORS = {
     'button:has-text("Sign in")',
   ],
 
-  /** Terms / onboarding / welcome dialog dismissal buttons */
+  /** Terms / onboarding / welcome dialog dismissal buttons (strictly scoped to modal dialogs, never Run Settings panel) */
   dismissDialogs: [
-    'button:has-text("Accept")',
-    'button:has-text("I agree")',
-    'button:has-text("Got it")',
-    'button:has-text("Continue")',
-    'button:has-text("Close")',
-    'button[aria-label="Close" i]',
+    'mat-dialog-container button:has-text("Accept")',
+    'mat-dialog-container button:has-text("I agree")',
+    'mat-dialog-container button:has-text("Got it")',
+    'mat-dialog-container button:has-text("Continue")',
+    '[role="dialog"] button:has-text("Accept")',
+    '[role="dialog"] button:has-text("I agree")',
+    '[role="dialog"] button:has-text("Got it")',
   ],
 
   /** New Chat / Create new prompt button */
