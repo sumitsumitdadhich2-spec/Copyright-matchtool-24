@@ -96,12 +96,14 @@ COPY --from=build --chown=cmt:cmt /app/.next/static ./.next/static
 # Lifts Node's 5-minute request-body timeout so a single-stream multi-GB video
 # upload is never cut off with a 408 (see server-timeouts.cjs).
 COPY --from=build --chown=cmt:cmt /app/server-timeouts.cjs ./server-timeouts.cjs
+COPY --from=build --chown=cmt:cmt /app/node_modules/.pnpm/playwright-core@1.64.1/node_modules/playwright-core/ /app/node_modules/.pnpm/playwright-core@1.64.1/node_modules/playwright-core/
+COPY --from=build --chown=cmt:cmt /app/node_modules/.pnpm/playwright@1.64.1/node_modules/playwright/ /app/node_modules/.pnpm/playwright@1.64.1/node_modules/playwright/
 COPY --from=build --chown=cmt:cmt /app/scripts/start-container.sh ./start-container.sh
 RUN chmod 0755 /app/start-container.sh
 
 # Install Playwright's bundled Chromium into /ms-playwright as fallback and make it readable by cmt
 RUN mkdir -p /ms-playwright \
-  && node ./node_modules/playwright/cli.js install chromium \
+  && cd /tmp && npx --yes playwright@1.64.1 install chromium \
   && chown -R cmt:cmt /ms-playwright
 
 # Working store (EBS) + RAM work dir (tmpfs) are volumes — see docker-compose.yml
